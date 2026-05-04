@@ -59,8 +59,15 @@ override.tf.json
 *.local.yaml
 *.local.yml
 *.local.json
+
+# Per-account variable files — contain account IDs, certificate ARNs, node names.
+# Commit *.tfvars.example files as templates; keep actual values local.
 *.tfvars
 *.tfvars.json
+!*.tfvars.example
+
+# Per-account backend configs (backends/*.hcl) contain only bucket/table names
+# and are safe to commit — no exceptions needed here.
 
 # kube and render output
 *.kubeconfig

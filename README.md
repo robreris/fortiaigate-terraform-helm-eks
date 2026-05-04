@@ -74,15 +74,104 @@ Example for ECR with repository prefix `123456789.dkr.ecr.us-east-1.amazonaws.co
 
 ---
 
+## Remote state (S3 + DynamoDB)
+
+State is stored in S3, with one bucket and one DynamoDB lock table per AWS account. This keeps state isolated — switching AWS credentials is all that is needed to switch accounts.
+
+### One-time bootstrap per account
+
+Run these commands once with credentials for the target account active. Choose a bucket name that is globally unique, e.g. include the account ID.
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+BUCKET="fortiaigate-tfstate-${ACCOUNT_ID}"
+REGION="us-west-2"   # match the region you will deploy into
+
+# S3 bucket (us-east-1 is the S3 default region and rejects LocationConstraint)
+if [ "${REGION}" = "us-east-1" ]; then
+  aws s3api create-bucket --bucket "${BUCKET}" --region "${REGION}"
+else
+  aws s3api create-bucket --bucket "${BUCKET}" --region "${REGION}" \
+    --create-bucket-configuration LocationConstraint="${REGION}"
+fi
+aws s3api put-bucket-versioning --bucket "${BUCKET}" \
+  --versioning-configuration Status=Enabled
+aws s3api put-bucket-encryption --bucket "${BUCKET}" \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+aws s3api put-public-access-block --bucket "${BUCKET}" \
+  --public-access-block-configuration \
+  "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+
+# DynamoDB lock table
+aws dynamodb create-table \
+  --table-name terraform-state-lock \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region "${REGION}"
+```
+
+### Backend config files
+
+The `backends/` directory contains one `.hcl` file per account. These files are committed to the repo (they contain no secrets — only bucket and table names). Fill in the placeholder values after running the bootstrap above.
+
+```
+backends/
+├── dev.hcl
+└── prod.hcl
+```
+
+Each file looks like:
+
+```hcl
+bucket         = "fortiaigate-tfstate-<account-id>"
+key            = "fortiaigate-eks/terraform.tfstate"
+region         = "us-west-2"
+dynamodb_table = "terraform-state-lock"
+encrypt        = true
+```
+
+### Variable files
+
+The `tfvars/` directory contains one `.tfvars` file per account. Actual `.tfvars` files are gitignored (they contain account IDs, certificate ARNs, and node names). Committed `.tfvars.example` files serve as templates.
+
+```
+tfvars/
+├── dev.tfvars.example    ← committed template
+├── dev.tfvars            ← local only (gitignored)
+├── prod.tfvars.example   ← committed template
+└── prod.tfvars           ← local only (gitignored)
+```
+
+### Day-to-day workflow
+
+```bash
+# 1. Activate credentials for the target account
+export AWS_PROFILE=dev   # or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+
+# 2. Initialize (first time on this machine, or when switching accounts)
+terraform init -backend-config=backends/dev.hcl -reconfigure
+
+# 3. Plan / apply
+terraform apply -var-file=tfvars/dev.tfvars
+```
+
+Use `-reconfigure` (not `-migrate-state`) when switching between accounts — you are pointing at a different backend, not copying state between them.
+
+---
+
 ## Deployment
 
 ### 1. Configure variables
 
+Copy the example for the target account and fill in the real values:
+
 ```bash
-cp terraform.tfvars.example terraform.tfvars
+cp tfvars/dev.tfvars.example tfvars/dev.tfvars
 ```
 
-Edit `terraform.tfvars` and set at minimum:
+Edit `tfvars/dev.tfvars` and set at minimum:
 
 ```hcl
 image_repository = "123456789.dkr.ecr.us-east-1.amazonaws.com/fortiaigate"
@@ -121,8 +210,16 @@ See [Variable reference](#variable-reference) for all options.
 
 ### 2. Initialize Terraform
 
+Pass the backend config for the target account:
+
 ```bash
-terraform init
+terraform init -backend-config=backends/dev.hcl
+```
+
+If you have previously initialized with a different backend (e.g. switching from local state or another account), add `-reconfigure`:
+
+```bash
+terraform init -backend-config=backends/dev.hcl -reconfigure
 ```
 
 ### 3. Deploy the cluster and application
@@ -153,7 +250,7 @@ Licenses are mapped per node. First, retrieve node names after the initial apply
 kubectl get nodes -o custom-columns=NAME:.metadata.name --no-headers
 ```
 
-Then, add the `licenses` map to `terraform.tfvars`:
+Then, add the `licenses` map to `tfvars/dev.tfvars` (or whichever account file you are using):
 
 ```hcl
 licenses = {
@@ -167,7 +264,7 @@ Terraform creates a `fortiaigate-license-config` ConfigMap in the `fortiaigate` 
 **Step 3c — deploy EFS, storage, and FortiAIGate (≈5–10 min):**
 
 ```bash
-terraform apply
+terraform apply -var-file=tfvars/dev.tfvars
 ```
 
 Terraform provisions the remaining resources in order:
@@ -302,7 +399,7 @@ To update the licenses associated with cluster nodes:
 kubectl get nodes -o custom-columns=NAME:.metadata.name --no-headers
 ```
 
-**Step 2** — update the `licenses` map in `terraform.tfvars`:
+**Step 2** — update the `licenses` map in `tfvars/<account>.tfvars`:
 
 ```hcl
 licenses = {
@@ -314,7 +411,7 @@ licenses = {
 **Step 3** — re-apply:
 
 ```bash
-terraform apply
+terraform apply -var-file=tfvars/<account>.tfvars
 ```
 
 ---
@@ -494,7 +591,7 @@ kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-cont
 After Helm releases are gone, run:
 
 ```bash
-terraform destroy
+terraform destroy -var-file=tfvars/<account>.tfvars
 ```
 
 If `terraform destroy` still times out, rerun it after checking for stuck Kubernetes resources:
