@@ -229,7 +229,7 @@ terraform init -backend-config=backends/dev.hcl -reconfigure
 **Step 3a — bootstrap VPC and EKS cluster (≈10–15 min):**
 
 ```bash
-terraform apply -target=module.vpc -target=module.eks
+terraform apply -target=module.vpc -target=module.eks -var-file=tfvars/dev.tfvars
 ```
 
 Once complete, run a kubeconfig update and confirm the cluster control plane is reachable before continuing:
