@@ -97,6 +97,36 @@ locals {
   })]
 }
 
+resource "helm_release" "nvidia_device_plugin" {
+  count = var.gpu_enabled ? 1 : 0
+
+  name       = "nvidia-device-plugin"
+  repository = "https://nvidia.github.io/k8s-device-plugin"
+  chart      = "nvidia-device-plugin"
+  version    = "0.14.5"
+  namespace  = "kube-system"
+
+  set {
+    name  = "tolerations[0].key"
+    value = "fortiaigate-gpu"
+  }
+  set {
+    name  = "tolerations[0].operator"
+    value = "Equal"
+  }
+  set {
+    name  = "tolerations[0].value"
+    value = "true"
+    type  = "string"
+  }
+  set {
+    name  = "tolerations[0].effect"
+    value = "NoSchedule"
+  }
+
+  depends_on = [module.eks]
+}
+
 resource "helm_release" "fortiaigate" {
   name      = "fortiaigate"
   chart     = "${path.module}/fortiaigate"
@@ -108,6 +138,7 @@ resource "helm_release" "fortiaigate" {
     kubernetes_config_map.licenses,
     kubernetes_secret.tls,
     helm_release.aws_load_balancer_controller,
+    helm_release.nvidia_device_plugin,
   ]
 
   # Values are merged left-to-right; later entries take precedence.

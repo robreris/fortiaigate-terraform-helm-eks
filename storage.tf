@@ -57,7 +57,7 @@ resource "aws_efs_file_system" "fortiaigate" {
   creation_token   = var.cluster_name
   performance_mode = "generalPurpose"
   throughput_mode  = "elastic"
-  encrypted        = true
+  encrypted        = var.efs_encrypted
 
   tags = {
     Name = var.cluster_name

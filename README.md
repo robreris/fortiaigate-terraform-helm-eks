@@ -50,6 +50,10 @@ FortiAIGate services deployed by the Helm chart:
 - For internet-facing AWS ALB ingress: an ACM certificate in the same AWS region as `aws_region`
 - For internet-facing ALB with custom DNS: an existing Route 53 hosted zone for the domain used by `ingress_host`
 
+### GPU (optional)
+
+When `gpu_enabled = true`, the NVIDIA Kubernetes device plugin is required for the GPU node to advertise `nvidia.com/gpu` resources to the scheduler. Terraform installs it automatically — no manual action needed. See [NVIDIA device plugin](#nvidia-device-plugin) for details and troubleshooting.
+
 ### Images
 
 All FortiAIGate images must be available at `<image_repository>/<service>:<image_tag>`. The expected service names are:
@@ -603,6 +607,49 @@ helm list -A
 ```
 
 > **Note:** The EFS filesystem has `reclaim_policy = Retain`. After `terraform destroy`, the EFS filesystem and its data remain in AWS and must be deleted manually if no longer needed.
+
+---
+
+## NVIDIA device plugin
+
+The [NVIDIA Kubernetes device plugin](https://github.com/NVIDIA/k8s-device-plugin) is a DaemonSet that runs on GPU nodes and advertises `nvidia.com/gpu` as a schedulable resource. Without it, the Kubernetes scheduler cannot allocate GPU resources and the Triton pod will stay `Pending` with:
+
+```
+Insufficient nvidia.com/gpu
+```
+
+The `AL2_x86_64_GPU` AMI ships with NVIDIA drivers and the container toolkit pre-installed. The device plugin is the only additional component needed for Kubernetes to see and schedule against the GPU.
+
+### Automatic installation
+
+When `gpu_enabled = true`, Terraform installs the device plugin automatically as a Helm release in `kube-system`. The DaemonSet is configured to tolerate the `fortiaigate-gpu=true:NoSchedule` taint so it schedules on the GPU node. No manual action is required on a fresh deployment.
+
+### Manual installation
+
+If you need to install or reinstall the device plugin outside of Terraform (e.g. after manually resizing the GPU node group):
+
+```bash
+helm repo add nvdp https://nvidia.github.io/k8s-device-plugin
+helm repo update nvdp
+helm upgrade --install nvidia-device-plugin nvdp/nvidia-device-plugin \
+  --namespace kube-system \
+  --set tolerations[0].key=fortiaigate-gpu \
+  --set tolerations[0].operator=Equal \
+  --set-string tolerations[0].value=true \
+  --set tolerations[0].effect=NoSchedule
+kubectl rollout status ds/nvidia-device-plugin-daemonset -n kube-system --timeout=120s
+```
+
+### Verifying GPU resource availability
+
+After the device plugin is running, confirm the GPU node is advertising resources:
+
+```bash
+kubectl get pods -n kube-system | grep nvidia
+kubectl describe node -l fortiaigate-role=gpu | grep -A10 "Capacity:"
+```
+
+`nvidia.com/gpu: 1` should appear in both the `Capacity` and `Allocatable` sections. If it is missing, check that the device plugin DaemonSet pod is `Running` on the GPU node.
 
 ---
 

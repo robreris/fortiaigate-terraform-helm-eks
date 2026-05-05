@@ -93,6 +93,12 @@ variable "storage_size" {
   default     = "100Gi"
 }
 
+variable "efs_encrypted" {
+  description = "Encrypt the EFS file system at rest with a KMS key. Disable if no suitable KMS key is available in the account."
+  type        = bool
+  default     = true
+}
+
 variable "licenses" {
   description = "Map of EKS node name to local license file path. Node names are available after cluster creation via 'kubectl get nodes'. Example: { \"ip-10-0-1-100.us-east-1.compute.internal\" = \"/path/to/license.lic\" }"
   type        = map(string)
