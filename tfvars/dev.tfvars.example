@@ -1,0 +1,62 @@
+# Dev account — copy to tfvars/dev.tfvars and fill in real values.
+# Usage: terraform apply -var-file=tfvars/dev.tfvars
+
+# ---------------------------------------------------------------------------
+# Required
+# ---------------------------------------------------------------------------
+
+image_repository = "<account-id>.dkr.ecr.<region>.amazonaws.com/fortiaigate"
+
+# ---------------------------------------------------------------------------
+# Infrastructure
+# ---------------------------------------------------------------------------
+
+aws_region   = "us-east-1"
+cluster_name = "fortiaigate-dev"
+image_tag    = "V8.0.0-build0024"
+app_node_count = 1
+
+# ---------------------------------------------------------------------------
+# GPU support
+# ---------------------------------------------------------------------------
+
+gpu_enabled            = true
+gpu_node_instance_type = "g5.2xlarge"
+
+# ---------------------------------------------------------------------------
+# Ingress
+# ---------------------------------------------------------------------------
+
+aws_load_balancer_controller_enabled = true
+ingress_class                        = "alb"
+#internal                             = false   # internal ALB for dev; no ACM cert needed
+#ingress_host                         = ""
+
+#For internet-facing ALB with HTTPS, uncomment and fill in:
+internal     = false
+ingress_host                         = "fortiaigate.example.com"
+ingress_annotations = {
+  "kubernetes.io/ingress.class"                = "alb"
+  "alb.ingress.kubernetes.io/scheme"           = "internet-facing"
+  "alb.ingress.kubernetes.io/target-type"      = "ip"
+  "alb.ingress.kubernetes.io/listen-ports"     = "[{\"HTTPS\":443}]"
+  "alb.ingress.kubernetes.io/backend-protocol" = "HTTPS"
+  "alb.ingress.kubernetes.io/certificate-arn"  = "arn:aws:acm:<region>:<account-id>:certificate/<id>"
+}
+
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+
+storage_size = "100Gi"
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+# Node names are available after the cluster is created:
+#   kubectl get nodes -o custom-columns=NAME:.metadata.name --no-headers
+
+licenses = {
+  # "ip-10-0-x-x.us-east-1.compute.internal" = "licenses/YOURNODE.lic"
+}
