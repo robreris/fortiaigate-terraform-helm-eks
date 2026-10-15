@@ -7,21 +7,17 @@ resource "kubernetes_namespace" "fortiaigate" {
     delete = "1h"
   }
 
-  depends_on = [module.eks]
+  # Reverse destroy ordering keeps cleanup controllers available until the
+  # namespace and any remaining namespaced objects have finished deletion.
+  # Do not force-remove namespace/resource finalizers to bypass AWS cleanup.
+  depends_on = [
+    module.eks,
+    helm_release.aws_load_balancer_controller,
+    aws_eks_addon.efs_csi,
+  ]
 }
 
 locals {
-  license_cm_name = length(kubernetes_config_map.licenses) > 0 ? "fortiaigate-license-config" : ""
-
-  # Pass node names into global.licenses so the Helm affinity blocks can use them.
-  # Values are empty strings — the actual license content lives in the ConfigMap created
-  # by licenses.tf. Node names contain dots so set{} blocks can't be used here.
-  license_node_values = length(var.licenses) > 0 ? [yamlencode({
-    global = {
-      licenses = { for node_name, _ in var.licenses : node_name => "" }
-    }
-  })] : []
-
   # GPU placement values — only included when gpu_enabled = true.
   # Using yamlencode avoids the set{} block limitation with YAML lists (tolerations).
   gpu_values = var.gpu_enabled ? [yamlencode({
@@ -36,31 +32,9 @@ locals {
         }]
       }
     }
-    license_manager = {
-      placement = {
-        tolerations = [{
-          key      = "fortiaigate-gpu"
-          operator = "Equal"
-          value    = "true"
-          effect   = "NoSchedule"
-        }]
-      }
-    }
-  })] : []
-
-  # Ingress annotations — yamlencode handles keys with dots and slashes correctly,
-  # which the set{} name path syntax cannot express.
-  ingress_annotation_values = length(var.ingress_annotations) > 0 ? [yamlencode({
-    ingress = { annotations = var.ingress_annotations }
-  })] : []
-
-  # Internal ALB: override the chart's default internet-facing scheme.
-  # Placed before ingress_annotation_values so explicit ingress_annotations can still override.
-  internal_alb_values = (var.internal && var.ingress_class == "alb") ? [yamlencode({
-    ingress = {
-      annotations = {
-        "alb.ingress.kubernetes.io/scheme" = "internal"
-      }
+    # This stack has one GPU: co-locate both engines on that card.
+    vllm = {
+      gpuAttach = "shared"
     }
   })] : []
 
@@ -68,29 +42,34 @@ locals {
   # into Helm. Pod template annotations use the checksum to trigger rollouts
   # when Terraform regenerates the certificate.
   tls_secret_name     = kubernetes_secret.tls.metadata[0].name
-  tls_secret_checksum = sha256(tls_self_signed_cert.fortiaigate.cert_pem)
+  tls_secret_checksum = sha256(local.web_certificate)
   tls_values = [yamlencode({
     tls = {
-      existingSecret         = local.tls_secret_name
-      existingSecretChecksum = local.tls_secret_checksum
+      existingSecret                 = local.tls_secret_name
+      existingSecretChecksum         = local.tls_secret_checksum
+      internalExistingSecret         = kubernetes_secret.internal_tls.metadata[0].name
+      internalExistingSecretChecksum = sha256(local.internal_certificate)
+      internalMountPath              = "/etc/internal-tls"
     }
     postgresql = {
       tls = {
-        certificatesSecret = local.tls_secret_name
+        certificatesSecret = kubernetes_secret.internal_tls.metadata[0].name
+        certCAFilename     = "ca.crt"
       }
       primary = {
         podAnnotations = {
-          "checksum/tls" = local.tls_secret_checksum
+          "checksum/tls" = sha256(local.internal_certificate)
         }
       }
     }
     redis = {
       tls = {
-        existingSecret = local.tls_secret_name
+        existingSecret = kubernetes_secret.internal_tls.metadata[0].name
+        certCAFilename = "ca.crt"
       }
       master = {
         podAnnotations = {
-          "checksum/tls" = local.tls_secret_checksum
+          "checksum/tls" = sha256(local.internal_certificate)
         }
       }
     }
@@ -137,30 +116,23 @@ resource "helm_release" "fortiaigate" {
   namespace = kubernetes_namespace.fortiaigate.metadata[0].name
   timeout   = 1200
 
-  lifecycle {
-    precondition {
-      condition     = !var.gpu_enabled || length(var.licenses) == 0 || length(var.licenses) >= var.app_node_count + 1
-      error_message = "When gpu_enabled is true and licenses are provided, include licenses for the app node(s) plus the GPU node. Get the GPU node name with: kubectl get nodes -l fortiaigate-role=gpu -o custom-columns=NAME:.metadata.name --no-headers"
-    }
-  }
-
   depends_on = [
     kubernetes_storage_class.efs,
-    kubernetes_config_map.licenses,
     kubernetes_secret.tls,
+    kubernetes_secret.internal_tls,
+    terraform_data.ingress_configuration,
     helm_release.aws_load_balancer_controller,
     helm_release.nvidia_device_plugin,
   ]
 
   # Values are merged left-to-right; later entries take precedence.
-  # User-supplied extra_values_files go first so gpu and annotation overrides win.
+  # Advanced files override profile defaults; explicit tfvars tuning and
+  # mandatory placement/ingress/TLS settings take precedence over those files.
   values = concat(
-    [for f in var.extra_values_files : file(f)],
+    local.gpu_helm_values,
     local.gpu_values,
-    local.internal_alb_values,
     local.ingress_annotation_values,
     local.tls_values,
-    local.license_node_values,
   )
 
   set {
@@ -194,9 +166,5 @@ resource "helm_release" "fortiaigate" {
   set {
     name  = "storage.size"
     value = var.storage_size
-  }
-  set {
-    name  = "license.existingConfigMap"
-    value = local.license_cm_name
   }
 }

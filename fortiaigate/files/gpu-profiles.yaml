@@ -1,0 +1,99 @@
+# Per-card tuning profiles for what the chart runs on the GPU: Triton (the
+# DLP model), the policyGuard vLLM server, and the dispatcher's two GPU scan
+# queues. SELECTED by fortiaigate.gpu.type in values.yaml, which names one of
+# the profiles below. Not set, or a name that is not here, is `default`; the
+# chart's notes (`helm get notes <release>`) say which profile is in use and
+# where every knob came from.
+#
+# PRECEDENCE, per knob: a value set in values.yaml > the selected profile >
+# `default`. The values.yaml knobs these profiles govern ship EMPTY, which is
+# how the chart tells "not set" from "set to what the old default was"; a
+# customer who sets one keeps it whatever profile is selected.
+#
+# This table lives in files/, INSIDE the chart, and not in values.yaml, on
+# purpose: the install docs say to copy values.yaml whole, and `helm upgrade
+# --reuse-values` lays that copy over the new chart, so a table in values.yaml
+# would be frozen at whatever the customer copied and a card added here later
+# would never reach an upgraded deployment.
+#
+# Every profile inherits `default` and lists only what differs, so a new card
+# is a short entry. A profile cannot blank a value `default` sets (leave the
+# key out to inherit it); it can only replace it. `default` must set every
+# knob. The render refuses a key not in this list (fortiaigate.gpuProfileKeys,
+# _helpers.tpl), so a misspelt key fails `helm template` instead of tuning
+# nothing. Adding a knob: see the "New GPU-sized knob" bullet in CLAUDE.md.
+#
+#   description                 one line for the chart's notes
+#   devOnly                     true marks a profile for the development
+#                               environment: selectable by name like any other,
+#                               but left out of the names the chart's notes
+#                               list for an unknown type, and not named in
+#                               values.yaml, the README or the docs
+#   triton.dlpInstancesPerGpu   instance_group count in the DLP model's config.pbtxt
+#                               (values.yaml triton.dlpInstancesPerGpu)
+#   triton.dlpMaxBatchSize      the DLP model's max_batch_size; its preferred
+#                               batch sizes [half, whole] and TensorRT opt/max
+#                               shapes (half x 512, whole x 512) are derived
+#                               from it (values.yaml triton.dlpMaxBatchSize)
+#   triton.cpuLimit             triton.resources.limits.cpu: one core per DLP
+#                               instance per card, plus one
+#   vllm.maxNumSeqs             --max-num-seqs          (values.yaml vllm.maxNumSeqs)
+#   vllm.apiServerCount         --api-server-count      (vllm.apiServerCount)
+#   vllm.blockSize              --block-size; "" = the engine's own default (vllm.blockSize)
+#   vllm.gpuMemoryUtilization   --gpu-memory-utilization; "" = by attach mode,
+#                               0.85 on a card of its own, 0.80 shared with Triton
+#   vllm.cpuLimit               vllm.resources.limits.cpu
+#   vllm.cpuRequest             vllm.resources.requests.cpu
+#   guardrail.dlpQueueChars     GUARDRAIL_DLP_QUEUE_CHARS    (guardrail.guardrail.env)
+#   guardrail.policyQueueChars  GUARDRAIL_POLICY_QUEUE_CHARS (keep equal to the DLP one)
+#
+# Numbers are quoted where they are large (the queue sizes): Helm reads YAML
+# numbers as floats and prints a million or more in exponent form, which the
+# dispatcher's parser would reject and silently fall back from. The render
+# re-prints integral numbers in plain decimal anyway, but quoting is the
+# spelling that cannot go wrong.
+
+# `default` IS the RTX PRO 6000 tuning, the card the product is qualified on;
+# it is also what any card not listed here gets.
+default:
+  description: "The NVIDIA RTX PRO 6000 Blackwell (96 GB) tuning, measured with vLLM sharing the card: 3 DLP instances batching up to 16 windows, 2 vLLM API servers. Also what any card not listed gets."
+  triton:
+    dlpInstancesPerGpu: 3
+    dlpMaxBatchSize: 16
+    cpuLimit: 5000m
+  vllm:
+    maxNumSeqs: 512
+    apiServerCount: 2
+    blockSize: ""
+    gpuMemoryUtilization: ""
+    cpuLimit: 4000m
+    cpuRequest: 3000m
+  guardrail:
+    dlpQueueChars: "2000000"
+    policyQueueChars: "2000000"
+
+rtx-pro-6000:
+  description: "NVIDIA RTX PRO 6000 Blackwell, 96 GB. The chart's default tuning."
+
+l4:
+  devOnly: true
+  description: "NVIDIA L4, 24 GB. Development environments only: one DLP instance is all that fits beside vLLM on the shared card, batching up to 16 windows."
+  triton:
+    dlpInstancesPerGpu: 1
+    dlpMaxBatchSize: 8
+  vllm:
+    maxNumSeqs: 64
+    apiServerCount: 1
+    cpuRequest: 1000m
+
+b200:
+  description: "NVIDIA B200. 4 DLP instances batching up to 32 windows, 4 vLLM API servers on 8 cores, 128-token KV-cache blocks."
+  triton:
+    dlpInstancesPerGpu: 4
+    dlpMaxBatchSize: 32
+    cpuLimit: 8000m
+  vllm:
+    apiServerCount: 4
+    blockSize: 128
+    cpuLimit: 8000m
+    cpuRequest: 7000m

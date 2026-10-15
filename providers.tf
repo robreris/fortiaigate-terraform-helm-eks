@@ -6,11 +6,9 @@ provider "aws" {
 # This means the AWS CLI must be installed and configured with credentials that have
 # eks:DescribeCluster and the ability to obtain a token for the cluster.
 #
-# NOTE: On the very first apply (when the cluster doesn't exist yet), Terraform
-# defers provider initialization for helm/kubernetes until after the EKS module
-# has been applied. If you see provider connection errors during 'terraform plan',
-# run: terraform apply -target=module.eks -target=module.vpc first, then re-run
-# terraform apply for the full deployment.
+# First bootstrap module.vpc and module.eks with the account tfvars before
+# planning/applying Kubernetes or Helm resources. The cluster must exist and
+# authorize the caller; Terraform cannot defer every provider operation safely.
 
 provider "helm" {
   kubernetes {

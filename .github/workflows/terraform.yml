@@ -34,6 +34,8 @@ jobs:
       - name: terraform init (backend=false)
         run: terraform init -backend=false
       - run: terraform validate
+      - run: python3 scripts/test_tls.py
+      - run: python3 -m unittest discover -s tests -p test_teardown.py
 
   tflint:
     name: tflint
@@ -54,5 +56,14 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: v3.16.2
-      - run: helm dependency update fortiaigate
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+      # Use the bundled subcharts, which include deployment-license affinity fixes.
       - run: helm lint fortiaigate
+      - run: python3 -m pip install PyYAML
+      - run: python3 tests/check_chart.py
+      - run: python3 tests/check_gpu_tuning.py
+      - run: python3 tests/check_ingress_tls.py
+      - run: python3 -m unittest discover -s tests -p test_tls_material.py
