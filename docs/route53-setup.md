@@ -38,7 +38,9 @@ for value in AWS_REGION ALB_DNS_NAME ROUTE53_ZONE_ID ALB_ZONE_ID; do
   }
 done
 
-cat > /tmp/fortiaigate-route53-change.json <<EOF
+CHANGE_FILE="$(mktemp)"
+trap 'rm -f "$CHANGE_FILE"' EXIT
+cat > "$CHANGE_FILE" <<EOF
 {
   "Comment": "Point ${APP_HOST} to the FortiAIGate ALB",
   "Changes": [
@@ -60,7 +62,7 @@ EOF
 
 aws route53 change-resource-record-sets \
   --hosted-zone-id "${ROUTE53_ZONE_ID}" \
-  --change-batch file:///tmp/fortiaigate-route53-change.json
+  --change-batch "file://${CHANGE_FILE}"
 ```
 
 If `ROUTE53_ZONE_ID` resolves to the wrong hosted zone because both public and private zones share the same name, set `ROUTE53_ZONE_ID` manually to the public hosted zone ID and rerun the `change-resource-record-sets` command.

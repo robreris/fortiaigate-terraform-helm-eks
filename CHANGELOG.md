@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Correct deploy/teardown documentation: staged Terraform teardown, explicit EFS data deletion/access-point cleanup, backup requirements, 8.0.2 verification, and the Terraform 1.9 minimum required by cross-variable validation.
+
+- Adapt the sister AKS repo's generated-CA and separate web/internal TLS pattern, including supplied PEM certificates, CA outputs, and local UI proxy.
+- Enforce internal/public ALB exposure, add independent ACM frontend configuration, avoid unintended certificate discovery, and use service-specific ALB health checks.
+- Add isolated mocked Terraform ingress/TLS tests, real certificate validation, and ALB/nginx render checks.
+
+- Upgrade the bundled chart to FortiAIGate 8.0.2 build0054 from the supplied Fortinet archive, including LLM gateway, guardrail, vLLM, and encrypted model images.
+- Default GPU nodes to `g6e.2xlarge`; co-locate Triton and vLLM on the single GPU, preserving taint tolerations and `Recreate` rollouts.
+- Replace node-keyed license ConfigMaps and affinity with deployment licensing through the admin API. Reject non-empty legacy `licenses` maps with migration guidance.
+- Preserve EFS, Terraform-managed TLS and rotation checksums, and ingress annotation merging; route the console at `/ui` and LLM traffic at `/ai`.
+- Document verified image archive tags and the upgrade procedure; validate CPU, shared-GPU, and dedicated-GPU chart renders in CI using the bundled dependencies.
+
+
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]

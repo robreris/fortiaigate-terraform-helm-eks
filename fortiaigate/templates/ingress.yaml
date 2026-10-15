@@ -9,6 +9,8 @@
 {{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/healthcheck-protocol" "HTTPS" }}
 {{- end }}
 {{- else if eq $className "nginx" }}
+{{- $_ := set $defaultAnnotations "nginx.ingress.kubernetes.io/app-root" "/ui" }}
+{{- $_ := set $defaultAnnotations "nginx.ingress.kubernetes.io/proxy-body-size" "64m" }}
 {{- if .Values.tls.enabled }}
 {{- $_ := set $defaultAnnotations "nginx.ingress.kubernetes.io/backend-protocol" "HTTPS" }}
 {{- $_ := set $defaultAnnotations "nginx.ingress.kubernetes.io/healthcheck-protocol" "HTTPS" }}
@@ -61,13 +63,12 @@ spec:
     - http:
     {{- end }}
         paths:
-          - path: /v1/
-            pathType: Prefix
-            backend:
-              service:
-                name: core
-                port:
-                  number: 8080
+          # webui is served under the /ui basePath. More-specific API prefixes
+          # are matched first; /ui and / route the webui; /ai routes the LLM
+          # data plane (llm-gateway), which serves that mount root and nothing
+          # outside it.
+          # /api/ carries the WHOLE management API, /api/v1 included -- one
+          # backend, no per-prefix split.
           - path: /api/
             pathType: Prefix
             backend:
@@ -75,6 +76,26 @@ spec:
                 name: api
                 port:
                   number: 8000
+          - path: /ui
+            pathType: Prefix
+            backend:
+              service:
+                name: webui
+                port:
+                  number: 3000
+          # Pass /ai through unchanged; llm-gateway owns this mount root.
+          - path: /ai
+            pathType: Prefix
+            backend:
+              service:
+                name: llm-gateway
+                port:
+                  number: 8080
+          # Root -> the console, matching the docker deployment (nginx.conf
+          # sends `= /` to /ui). The gateway used to be the catch-all here, so
+          # every typo landed on the data plane and came back as dialect JSON;
+          # it now owns /ai and nothing else, which is what lets a passthrough
+          # namespace be admin-defined without a reserved-prefix list.
           - path: /
             pathType: Prefix
             backend:

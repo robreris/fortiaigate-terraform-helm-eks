@@ -18,7 +18,7 @@ For security vulnerabilities, do **not** open a public issue — see [SECURITY.m
 
 You need:
 
-- Terraform 1.5+
+- Terraform 1.9+
 - AWS CLI v2
 - Helm 3
 - [`tflint`](https://github.com/terraform-linters/tflint) — same checks CI runs

@@ -34,7 +34,7 @@ variable "app_node_count" {
 }
 
 variable "gpu_enabled" {
-  description = "Add a GPU node group (g5.2xlarge) for Triton inference. When false, triton is disabled and all workloads run CPU-only."
+  description = "Add a GPU node group (g6e.2xlarge) for Triton and vLLM inference. When false, GPU inference is disabled; POLICY detectors fail closed."
   type        = bool
   default     = false
 }
@@ -42,7 +42,7 @@ variable "gpu_enabled" {
 variable "gpu_node_instance_type" {
   description = "EC2 instance type for the GPU node group"
   type        = string
-  default     = "g5.2xlarge"
+  default     = "g6e.2xlarge"
 }
 
 variable "gpu_node_ami_type" {
@@ -69,7 +69,7 @@ variable "image_repository" {
 variable "image_tag" {
   description = "Image tag for all FortiAIGate service images"
   type        = string
-  default     = "V8.0.0-build0024"
+  default     = "V8.0.2-build0054"
 }
 
 variable "namespace" {
@@ -96,7 +96,7 @@ variable "ingress_host" {
 }
 
 variable "ingress_annotations" {
-  description = "Additional ingress annotations. Used for ALB configuration (e.g. certificate ARN, scheme). Keys with dots/slashes are handled correctly via values YAML merge."
+  description = "Additional ingress annotations. ALB scheme must agree with internal; acm_certificate_arn takes precedence over its annotation. Keys with dots/slashes are handled via values YAML merge."
   type        = map(string)
   default     = {}
 }
@@ -131,9 +131,14 @@ variable "efs_encrypted" {
 }
 
 variable "licenses" {
-  description = "Map of EKS node name to local license file path. Node names are available after cluster creation via 'kubectl get nodes'. Example: { \"ip-10-0-1-100.us-east-1.compute.internal\" = \"/path/to/license.lic\" }"
+  description = "Deprecated in 8.0.2. Leave empty and upload deployment licenses through POST /api/v1/admin/licenses."
   type        = map(string)
   default     = {}
+
+  validation {
+    condition     = length(var.licenses) == 0
+    error_message = "FortiAIGate 8.0.2 uses deployment licenses. Remove the node-keyed licenses map and upload the license through POST /api/v1/admin/licenses after deployment."
+  }
 }
 
 variable "update_strategy" {
@@ -154,12 +159,56 @@ variable "extra_values_files" {
 }
 
 variable "internal" {
-  description = "Deploy as an internal (private) service. Sets the ALB scheme to 'internal' so it is only reachable within the VPC and connected networks. Requires ingress_class = 'alb'."
+  description = "Deploy as an internal (private) service. Sets and enforces the ALB scheme to internal so it is only reachable within the VPC and connected networks. Requires ingress_class = 'alb'."
   type        = bool
   default     = false
 
   validation {
     condition     = !var.internal || var.ingress_class == "alb"
     error_message = "internal = true is only supported with ingress_class = 'alb'."
+  }
+}
+
+variable "acm_certificate_arn" {
+  description = "Existing ACM certificate ARN for ALB frontend HTTPS, in aws_region. Works for public and internal ALBs. Empty keeps HTTP unless certificate-arn is supplied through ingress_annotations."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.acm_certificate_arn == "" || can(regex("^arn:[^:]+:acm:[^:]+:[0-9]{12}:certificate/.+$", var.acm_certificate_arn))
+    error_message = "acm_certificate_arn must be an ACM certificate ARN."
+  }
+}
+
+variable "tls_certificate_path" {
+  description = "Optional PEM certificate chain for web/API pod HTTPS (and nginx frontend TLS). Requires tls_private_key_path and ingress_host. ALB frontend TLS uses ACM independently."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.tls_certificate_path == "" ? true : can(regex("-----BEGIN CERTIFICATE-----", file(var.tls_certificate_path)))
+    error_message = "tls_certificate_path must point to a readable PEM certificate chain."
+  }
+}
+
+variable "tls_private_key_path" {
+  description = "Unencrypted PEM private key for tls_certificate_path. Contents are stored in Terraform state; keep the file outside version control."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.tls_private_key_path == "" ? true : can(regex("-----BEGIN (RSA |EC )?PRIVATE KEY-----", file(var.tls_private_key_path)))
+    error_message = "tls_private_key_path must point to a readable unencrypted PEM private key."
+  }
+}
+
+variable "tls_ca_certificate_path" {
+  description = "Optional PEM root CA for a supplied web certificate. Used for client trust export, not uploaded to ALB. Internal services always use the generated CA."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.tls_ca_certificate_path == "" ? true : can(regex("-----BEGIN CERTIFICATE-----", file(var.tls_ca_certificate_path)))
+    error_message = "tls_ca_certificate_path must point to a readable PEM certificate."
   }
 }

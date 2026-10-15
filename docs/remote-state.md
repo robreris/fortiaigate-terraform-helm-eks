@@ -66,7 +66,11 @@ export AWS_PROFILE=dev   # or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
 # 2. Initialize (first time on this machine, or when switching accounts)
 terraform init -backend-config=backends/dev.hcl -reconfigure
 
-# 3. Plan / apply
+# 3. First deploy: bootstrap AWS infrastructure before Helm/Kubernetes resources.
+terraform apply -target=module.vpc -target=module.eks -var-file=tfvars/dev.tfvars
+
+# 4. Plan / apply the rest (also the normal workflow for later updates).
+terraform plan -var-file=tfvars/dev.tfvars
 terraform apply -var-file=tfvars/dev.tfvars
 ```
 

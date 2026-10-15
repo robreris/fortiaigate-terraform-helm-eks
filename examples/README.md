@@ -21,7 +21,7 @@ terraform apply -var-file=examples/<name>/terraform.tfvars
 | Example | What it shows |
 |---------|---------------|
 | [`minimal`](./minimal) | Smallest possible config — `ingress_class = "nginx"`, no GPU, no ALB controller. Assumes an nginx ingress controller is already installed in the cluster (or that the ingress resource is just placeholder). |
-| [`internal-alb`](./internal-alb) | AWS ALB with `scheme: internal`. No ACM certificate or Route 53 entry needed; reachable only inside the VPC and connected networks. |
+| [`internal-alb`](./internal-alb) | AWS ALB with `scheme: internal`. HTTP evaluation without ACM; configure ACM and internal DNS for HTTPS. Reachable only inside the VPC and connected networks. |
 | [`internet-facing-alb`](./internet-facing-alb) | Public ALB with HTTPS, an ACM certificate, and a custom hostname. The ACM certificate must live in the same region as `aws_region`. |
 
 Each example's `terraform.tfvars` uses placeholder values (account IDs, ARNs, hostnames). Replace them with values for your environment before applying.

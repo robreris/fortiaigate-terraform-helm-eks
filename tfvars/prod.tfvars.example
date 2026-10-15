@@ -13,14 +13,14 @@ image_repository = "<account-id>.dkr.ecr.<region>.amazonaws.com/fortiaigate"
 
 aws_region   = "us-east-1"
 cluster_name = "fortiaigate-prod"
-image_tag    = "V8.0.0-build0024"
+image_tag    = "V8.0.2-build0054"
 
 # ---------------------------------------------------------------------------
 # GPU support
 # ---------------------------------------------------------------------------
 
 gpu_enabled            = true
-gpu_node_instance_type = "g5.2xlarge"
+gpu_node_instance_type = "g6e.2xlarge"
 
 # ---------------------------------------------------------------------------
 # Ingress
@@ -49,13 +49,11 @@ efs_encrypted = true
 # ---------------------------------------------------------------------------
 # Licenses
 # ---------------------------------------------------------------------------
-# Node names are available after the cluster is created:
-#   kubectl get nodes -o custom-columns=NAME:.metadata.name --no-headers
+# Upload a deployment license through POST /api/v1/admin/licenses after deployment.
 
-licenses = {
-  # App nodes:
-  # "ip-10-0-x-x.us-east-1.compute.internal" = "licenses/app-node-1.lic"
-  # "ip-10-0-y-y.us-east-1.compute.internal" = "licenses/app-node-2.lic"
-  # GPU node when gpu_enabled = true:
-  # "ip-10-0-z-z.us-east-1.compute.internal" = "licenses/gpu-node.lic"
-}
+# TLS: ALB frontend and pod web certificates are configured independently.
+# acm_certificate_arn = "arn:aws:acm:<region>:<account-id>:certificate/<id>"
+# tls_certificate_path = "/secure/fullchain.pem"
+# tls_private_key_path = "/secure/private.key"
+# tls_ca_certificate_path = "/secure/private-root-ca.pem"
+# See docs/ingress-and-tls.md.

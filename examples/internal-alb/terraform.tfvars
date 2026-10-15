@@ -1,6 +1,6 @@
 # Internal ALB: reachable only inside the VPC and connected networks
 # (VPN, Direct Connect, Transit Gateway, FortiGate-as-VPC-gateway).
-# No ACM certificate required, no Route 53 entry needed.
+# HTTP evaluation needs no ACM. For HTTPS, configure ACM and your internal DNS.
 
 aws_region   = "us-west-2"
 cluster_name = "fortiaigate-internal"
@@ -17,3 +17,7 @@ aws_load_balancer_controller_enabled = true
 
 gpu_enabled    = false
 app_node_count = 2
+
+# Recommended for console/API HTTPS (certificate must be in aws_region):
+# ingress_host        = "fortiaigate.corp.example.com"
+# acm_certificate_arn = "arn:aws:acm:us-west-2:123456789012:certificate/<id>"
