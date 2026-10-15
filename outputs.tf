@@ -40,3 +40,18 @@ output "alb_dns_name" {
   description = "ALB hostname assigned by AWS — use this to configure the FortiGate and chatbot"
   value       = try(data.kubernetes_ingress_v1.fortiaigate.status[0].load_balancer[0].ingress[0].hostname, "not yet assigned — run: kubectl get ingress fortiaigate-ingress -n ${var.namespace}")
 }
+
+output "tls_ca_certificate" {
+  description = "Root CA for generated/supplied web TLS. ALB clients trust the ACM frontend certificate independently."
+  value       = local.web_trusted_root
+}
+
+output "internal_tls_ca_certificate" {
+  description = "Generated CA for internal service and database TLS in every web certificate mode."
+  value       = tls_self_signed_cert.ca.cert_pem
+}
+
+output "ingress_scheme" {
+  description = "Configured ALB exposure scheme (null for other ingress controllers)."
+  value       = var.ingress_class == "alb" ? local.alb_scheme : null
+}

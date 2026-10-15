@@ -34,7 +34,7 @@ variable "app_node_count" {
 }
 
 variable "gpu_enabled" {
-  description = "Add a GPU node group (g5.2xlarge) for Triton inference. When false, triton is disabled and all workloads run CPU-only."
+  description = "Add a GPU node group (g6e.2xlarge) for Triton and vLLM inference. When false, GPU inference is disabled; POLICY detectors fail closed."
   type        = bool
   default     = false
 }
@@ -42,7 +42,7 @@ variable "gpu_enabled" {
 variable "gpu_node_instance_type" {
   description = "EC2 instance type for the GPU node group"
   type        = string
-  default     = "g5.2xlarge"
+  default     = "g6e.2xlarge"
 }
 
 variable "gpu_node_ami_type" {
@@ -53,6 +53,65 @@ variable "gpu_node_ami_type" {
   validation {
     condition     = contains(["AL2023_x86_64_NVIDIA", "AL2_x86_64_GPU"], var.gpu_node_ami_type)
     error_message = "gpu_node_ami_type must be either AL2023_x86_64_NVIDIA or AL2_x86_64_GPU."
+  }
+}
+
+variable "gpu_tuning_profile" {
+  description = "Inference defaults: auto selects g5 for G5 instances and chart otherwise; g5 uses shared A10G reference settings; chart retains vendor defaults."
+  type        = string
+  default     = "auto"
+
+  validation {
+    condition     = contains(["auto", "g5", "chart"], var.gpu_tuning_profile)
+    error_message = "gpu_tuning_profile must be auto, g5, or chart."
+  }
+}
+
+variable "gpu_tuning" {
+  description = "Optional inference overrides in tfvars. Unset fields inherit profile/chart values. Memory uses whole Mi/Gi quantities. Explicit fields override extra_values_files."
+  type = object({
+    triton_memory_request        = optional(string)
+    triton_memory_limit          = optional(string)
+    triton_dlp_instances_per_gpu = optional(number)
+    triton_dlp_max_batch_size    = optional(number)
+    vllm_memory_request          = optional(string)
+    vllm_memory_limit            = optional(string)
+    vllm_max_num_seqs            = optional(number)
+    vllm_api_server_count        = optional(number)
+    vllm_gpu_memory_utilization  = optional(number)
+    vllm_max_model_len           = optional(number)
+  })
+  default  = {}
+  nullable = false
+
+  validation {
+    condition = alltrue([for value in [
+      var.gpu_tuning.triton_memory_request, var.gpu_tuning.triton_memory_limit,
+      var.gpu_tuning.vllm_memory_request, var.gpu_tuning.vllm_memory_limit,
+    ] : value == null ? true : can(regex("^[1-9][0-9]*(Mi|Gi)$", value))])
+    error_message = "GPU memory overrides must be positive whole Mi/Gi quantities, e.g. 8192Mi or 12Gi."
+  }
+  validation {
+    condition = alltrue([for value in [
+      var.gpu_tuning.triton_dlp_instances_per_gpu, var.gpu_tuning.triton_dlp_max_batch_size,
+      var.gpu_tuning.vllm_max_num_seqs, var.gpu_tuning.vllm_api_server_count,
+      var.gpu_tuning.vllm_max_model_len,
+    ] : value == null ? true : value >= 1 && floor(value) == value])
+    error_message = "GPU instance counts, batch sizes, concurrency, API process counts, and context lengths must be positive whole numbers."
+  }
+  validation {
+    condition     = var.gpu_tuning.vllm_gpu_memory_utilization == null ? true : var.gpu_tuning.vllm_gpu_memory_utilization > 0 && var.gpu_tuning.vllm_gpu_memory_utilization < 1
+    error_message = "vllm_gpu_memory_utilization must be greater than 0 and less than 1."
+  }
+  validation {
+    condition = alltrue([for pair in [
+      [var.gpu_tuning.triton_memory_request, var.gpu_tuning.triton_memory_limit],
+      [var.gpu_tuning.vllm_memory_request, var.gpu_tuning.vllm_memory_limit],
+      ] : pair[0] == null || pair[1] == null ? true : try(
+      tonumber(regex("^([0-9]+)", pair[0])[0]) * (endswith(pair[0], "Gi") ? 1024 : 1) <=
+      tonumber(regex("^([0-9]+)", pair[1])[0]) * (endswith(pair[1], "Gi") ? 1024 : 1), false
+    )])
+    error_message = "An explicit GPU memory request must not exceed its explicit limit."
   }
 }
 
@@ -69,7 +128,7 @@ variable "image_repository" {
 variable "image_tag" {
   description = "Image tag for all FortiAIGate service images"
   type        = string
-  default     = "V8.0.0-build0024"
+  default     = "V8.0.2-build0055"
 }
 
 variable "namespace" {
@@ -96,7 +155,7 @@ variable "ingress_host" {
 }
 
 variable "ingress_annotations" {
-  description = "Additional ingress annotations. Used for ALB configuration (e.g. certificate ARN, scheme). Keys with dots/slashes are handled correctly via values YAML merge."
+  description = "Additional ingress annotations. ALB scheme must agree with internal; acm_certificate_arn takes precedence over its annotation. Keys with dots/slashes are handled via values YAML merge."
   type        = map(string)
   default     = {}
 }
@@ -131,9 +190,14 @@ variable "efs_encrypted" {
 }
 
 variable "licenses" {
-  description = "Map of EKS node name to local license file path. Node names are available after cluster creation via 'kubectl get nodes'. Example: { \"ip-10-0-1-100.us-east-1.compute.internal\" = \"/path/to/license.lic\" }"
+  description = "Deprecated in 8.0.2. Leave empty and upload deployment licenses through POST /api/v1/admin/licenses."
   type        = map(string)
   default     = {}
+
+  validation {
+    condition     = length(var.licenses) == 0
+    error_message = "FortiAIGate 8.0.2 uses deployment licenses. Remove the node-keyed licenses map and upload the license through POST /api/v1/admin/licenses after deployment."
+  }
 }
 
 variable "update_strategy" {
@@ -148,18 +212,62 @@ variable "update_strategy" {
 }
 
 variable "extra_values_files" {
-  description = "Additional Helm values YAML files to merge (applied left-to-right, later files take precedence)"
+  description = "Optional advanced Helm values files, merged left-to-right after GPU profile defaults and before explicit gpu_tuning, placement, ingress, and TLS settings."
   type        = list(string)
   default     = []
 }
 
 variable "internal" {
-  description = "Deploy as an internal (private) service. Sets the ALB scheme to 'internal' so it is only reachable within the VPC and connected networks. Requires ingress_class = 'alb'."
+  description = "Deploy as an internal (private) service. Sets and enforces the ALB scheme to internal so it is only reachable within the VPC and connected networks. Requires ingress_class = 'alb'."
   type        = bool
   default     = false
 
   validation {
     condition     = !var.internal || var.ingress_class == "alb"
     error_message = "internal = true is only supported with ingress_class = 'alb'."
+  }
+}
+
+variable "acm_certificate_arn" {
+  description = "Existing ACM certificate ARN for ALB frontend HTTPS, in aws_region. Works for public and internal ALBs. Empty keeps HTTP unless certificate-arn is supplied through ingress_annotations."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.acm_certificate_arn == "" || can(regex("^arn:[^:]+:acm:[^:]+:[0-9]{12}:certificate/.+$", var.acm_certificate_arn))
+    error_message = "acm_certificate_arn must be an ACM certificate ARN."
+  }
+}
+
+variable "tls_certificate_path" {
+  description = "Optional PEM certificate chain for web/API pod HTTPS (and nginx frontend TLS). Requires tls_private_key_path and ingress_host. ALB frontend TLS uses ACM independently."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.tls_certificate_path == "" ? true : can(regex("-----BEGIN CERTIFICATE-----", file(var.tls_certificate_path)))
+    error_message = "tls_certificate_path must point to a readable PEM certificate chain."
+  }
+}
+
+variable "tls_private_key_path" {
+  description = "Unencrypted PEM private key for tls_certificate_path. Contents are stored in Terraform state; keep the file outside version control."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.tls_private_key_path == "" ? true : can(regex("-----BEGIN (RSA |EC )?PRIVATE KEY-----", file(var.tls_private_key_path)))
+    error_message = "tls_private_key_path must point to a readable unencrypted PEM private key."
+  }
+}
+
+variable "tls_ca_certificate_path" {
+  description = "Optional PEM root CA for a supplied web certificate. Used for client trust export, not uploaded to ALB. Internal services always use the generated CA."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.tls_ca_certificate_path == "" ? true : can(regex("-----BEGIN CERTIFICATE-----", file(var.tls_ca_certificate_path)))
+    error_message = "tls_ca_certificate_path must point to a readable PEM certificate."
   }
 }

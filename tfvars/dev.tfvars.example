@@ -11,9 +11,9 @@ image_repository = "<account-id>.dkr.ecr.<region>.amazonaws.com/fortiaigate"
 # Infrastructure
 # ---------------------------------------------------------------------------
 
-aws_region   = "us-east-1"
-cluster_name = "fortiaigate-dev"
-image_tag    = "V8.0.0-build0024"
+aws_region     = "us-east-1"
+cluster_name   = "fortiaigate-dev"
+image_tag      = "V8.0.2-build0055"
 app_node_count = 1
 
 # ---------------------------------------------------------------------------
@@ -22,6 +22,15 @@ app_node_count = 1
 
 gpu_enabled            = true
 gpu_node_instance_type = "g5.2xlarge"
+gpu_tuning_profile     = "auto" # Selects shared A10G settings for G5; no YAML overlay.
+# Optional overrides; omit gpu_tuning to use the profile defaults.
+# gpu_tuning = {
+#   triton_memory_request = "12Gi"
+#   triton_memory_limit   = "25Gi"
+#   vllm_memory_request   = "8Gi"
+#   vllm_memory_limit     = "24Gi"
+#   vllm_max_num_seqs     = 64
+# }
 
 # ---------------------------------------------------------------------------
 # Ingress
@@ -34,7 +43,7 @@ ingress_class                        = "alb"
 
 #For internet-facing ALB with HTTPS, uncomment and fill in:
 internal     = false
-ingress_host                         = "fortiaigate.example.com"
+ingress_host = "fortiaigate.example.com"
 ingress_annotations = {
   "kubernetes.io/ingress.class"                = "alb"
   "alb.ingress.kubernetes.io/scheme"           = "internet-facing"
@@ -55,12 +64,12 @@ efs_encrypted = false
 # ---------------------------------------------------------------------------
 # Licenses
 # ---------------------------------------------------------------------------
-# Node names are available after the cluster is created:
-#   kubectl get nodes -o custom-columns=NAME:.metadata.name --no-headers
+# Upload the deployment license in the WebUI after deployment (or use
+# POST /api/v1/admin/licenses). No license tfvars or follow-up apply is needed.
 
-licenses = {
-  # App node:
-  # "ip-10-0-x-x.us-east-1.compute.internal" = "licenses/app-node.lic"
-  # GPU node when gpu_enabled = true:
-  # "ip-10-0-y-y.us-east-1.compute.internal" = "licenses/gpu-node.lic"
-}
+# TLS: ALB frontend and pod web certificates are configured independently.
+# acm_certificate_arn = "arn:aws:acm:<region>:<account-id>:certificate/<id>"
+# tls_certificate_path = "/secure/fullchain.pem"
+# tls_private_key_path = "/secure/private.key"
+# tls_ca_certificate_path = "/secure/private-root-ca.pem"
+# See docs/ingress-and-tls.md.

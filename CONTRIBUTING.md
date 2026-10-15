@@ -18,11 +18,11 @@ For security vulnerabilities, do **not** open a public issue — see [SECURITY.m
 
 You need:
 
-- Terraform 1.5+
+- Terraform 1.9+
 - AWS CLI v2
 - Helm 3
 - [`tflint`](https://github.com/terraform-linters/tflint) — same checks CI runs
-- [`terraform-docs`](https://terraform-docs.io/) — regenerates the README input table
+- [`terraform-docs`](https://terraform-docs.io/) — regenerates the [Terraform reference](docs/terraform-reference.md)
 - [`pre-commit`](https://pre-commit.com/) — runs all of the above before each commit
 
 Install the pre-commit hooks once:
@@ -47,7 +47,11 @@ terraform init -backend=false
 terraform validate
 tflint --recursive
 helm lint fortiaigate
+python3 scripts/test_tls.py
+python3 tests/check_gpu_tuning.py
 ```
+
+The isolated Terraform tests cover ingress, TLS, and GPU input validation using mocked providers. The GPU render check passes Terraform's composed values through Helm for G5, G6e, CPU-only, and explicit-override cases; it requires Helm and PyYAML and does not access AWS or local Terraform state.
 
 CI runs the same set on every PR (`.github/workflows/terraform.yml`).
 
@@ -56,7 +60,7 @@ CI runs the same set on every PR (`.github/workflows/terraform.yml`).
 - Branch from `main`. Keep PRs focused on a single concern.
 - Include a `terraform plan` excerpt in the description when the change affects infrastructure resources, not just docs/CI.
 - Update `CHANGELOG.md` under the `## [Unreleased]` section.
-- If you change variables, run `terraform-docs` (or let pre-commit run it) so the README input table stays in sync.
+- If you change variables, run `terraform-docs` (or let pre-commit run it) so the [Terraform reference](docs/terraform-reference.md) stays in sync.
 - New examples go under `examples/<scenario>/terraform.tfvars` with placeholder values, plus an entry in `examples/README.md`.
 
 ## Versioning
