@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Replace `CLAUDE.md` with concise repository guidance in `AGENTS.md`; move AWS Terraform and Helm implementation notes into `docs/technical-notes.md`.
 - Correct deploy/teardown documentation: staged Terraform teardown, explicit EFS data deletion/access-point cleanup, backup requirements, 8.0.2 verification, and the Terraform 1.9 minimum required by cross-variable validation.
 
 - Adapt the sister AKS repo's generated-CA and separate web/internal TLS pattern, including supplied PEM certificates, CA outputs, and local UI proxy.

@@ -308,6 +308,7 @@ kubectl get pods -n kube-system | grep efs
 - [`docs/remote-state.md`](./docs/remote-state.md) — S3 + DynamoDB backend bootstrap
 - [`docs/route53-setup.md`](./docs/route53-setup.md) — Route 53 alias for internet-facing ALB
 - [`docs/ingress-and-tls.md`](./docs/ingress-and-tls.md) — private/public ingress, ACM, and supplied/internal TLS
+- [`docs/technical-notes.md`](./docs/technical-notes.md) — Terraform and Helm architecture constraints
 - [`SECURITY.md`](./SECURITY.md) — vulnerability reporting + production hardening checklist
 - [`CONTRIBUTING.md`](./CONTRIBUTING.md) — dev setup, local checks, PR conventions
 - [`ROADMAP.md`](./ROADMAP.md) — known gaps and planned improvements
