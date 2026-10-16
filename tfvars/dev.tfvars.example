@@ -13,7 +13,7 @@ image_repository = "<account-id>.dkr.ecr.<region>.amazonaws.com/fortiaigate"
 
 aws_region     = "us-east-1"
 cluster_name   = "fortiaigate-dev"
-image_tag      = "V8.0.2-build0054"
+image_tag      = "V8.0.2-build0055"
 app_node_count = 1
 
 # ---------------------------------------------------------------------------

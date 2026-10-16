@@ -9,7 +9,7 @@ TAGS = {
     **dict.fromkeys([
         "api", "llm-gateway", "webui", "logd", "license_manager",
         "guardrail", "guardrail-scanner",
-    ], "V8.0.2-build0054"),
+    ], "V8.0.2-build0055"),
     "custom-triton": "25.11-onnx-trt-agt-rpt-s1",
     "vllm-server": "0.28.0-rpt-s1",
     "faig-models": "0.0.5-s1",

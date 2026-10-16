@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Advance Terraform/chart image defaults, development/production tfvars examples, render checks, and image/deployment documentation to FortiAIGate 8.0.2 build0055. The vendor chart and pinned GPU image versions are unchanged from build0054; document the exact registry tags required.
+
 - Replace `CLAUDE.md` with concise repository guidance in `AGENTS.md`; move AWS Terraform and Helm implementation notes into `docs/technical-notes.md`.
 - Correct deploy/teardown documentation: staged Terraform teardown, explicit EFS data deletion/access-point cleanup, backup requirements, 8.0.2 verification, and the Terraform 1.9 minimum required by cross-variable validation.
 

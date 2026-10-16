@@ -69,7 +69,7 @@ variable "image_repository" {
 variable "image_tag" {
   description = "Image tag for all FortiAIGate service images"
   type        = string
-  default     = "V8.0.2-build0054"
+  default     = "V8.0.2-build0055"
 }
 
 variable "namespace" {
