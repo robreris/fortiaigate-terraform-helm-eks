@@ -56,6 +56,65 @@ variable "gpu_node_ami_type" {
   }
 }
 
+variable "gpu_tuning_profile" {
+  description = "Inference defaults: auto selects g5 for G5 instances and chart otherwise; g5 uses shared A10G reference settings; chart retains vendor defaults."
+  type        = string
+  default     = "auto"
+
+  validation {
+    condition     = contains(["auto", "g5", "chart"], var.gpu_tuning_profile)
+    error_message = "gpu_tuning_profile must be auto, g5, or chart."
+  }
+}
+
+variable "gpu_tuning" {
+  description = "Optional inference overrides in tfvars. Unset fields inherit profile/chart values. Memory uses whole Mi/Gi quantities. Explicit fields override extra_values_files."
+  type = object({
+    triton_memory_request        = optional(string)
+    triton_memory_limit          = optional(string)
+    triton_dlp_instances_per_gpu = optional(number)
+    triton_dlp_max_batch_size    = optional(number)
+    vllm_memory_request          = optional(string)
+    vllm_memory_limit            = optional(string)
+    vllm_max_num_seqs            = optional(number)
+    vllm_api_server_count        = optional(number)
+    vllm_gpu_memory_utilization  = optional(number)
+    vllm_max_model_len           = optional(number)
+  })
+  default  = {}
+  nullable = false
+
+  validation {
+    condition = alltrue([for value in [
+      var.gpu_tuning.triton_memory_request, var.gpu_tuning.triton_memory_limit,
+      var.gpu_tuning.vllm_memory_request, var.gpu_tuning.vllm_memory_limit,
+    ] : value == null ? true : can(regex("^[1-9][0-9]*(Mi|Gi)$", value))])
+    error_message = "GPU memory overrides must be positive whole Mi/Gi quantities, e.g. 8192Mi or 12Gi."
+  }
+  validation {
+    condition = alltrue([for value in [
+      var.gpu_tuning.triton_dlp_instances_per_gpu, var.gpu_tuning.triton_dlp_max_batch_size,
+      var.gpu_tuning.vllm_max_num_seqs, var.gpu_tuning.vllm_api_server_count,
+      var.gpu_tuning.vllm_max_model_len,
+    ] : value == null ? true : value >= 1 && floor(value) == value])
+    error_message = "GPU instance counts, batch sizes, concurrency, API process counts, and context lengths must be positive whole numbers."
+  }
+  validation {
+    condition     = var.gpu_tuning.vllm_gpu_memory_utilization == null ? true : var.gpu_tuning.vllm_gpu_memory_utilization > 0 && var.gpu_tuning.vllm_gpu_memory_utilization < 1
+    error_message = "vllm_gpu_memory_utilization must be greater than 0 and less than 1."
+  }
+  validation {
+    condition = alltrue([for pair in [
+      [var.gpu_tuning.triton_memory_request, var.gpu_tuning.triton_memory_limit],
+      [var.gpu_tuning.vllm_memory_request, var.gpu_tuning.vllm_memory_limit],
+      ] : pair[0] == null || pair[1] == null ? true : try(
+      tonumber(regex("^([0-9]+)", pair[0])[0]) * (endswith(pair[0], "Gi") ? 1024 : 1) <=
+      tonumber(regex("^([0-9]+)", pair[1])[0]) * (endswith(pair[1], "Gi") ? 1024 : 1), false
+    )])
+    error_message = "An explicit GPU memory request must not exceed its explicit limit."
+  }
+}
+
 variable "image_repository" {
   description = "Container registry prefix for FortiAIGate images (e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/fortiaigate)"
   type        = string
@@ -153,7 +212,7 @@ variable "update_strategy" {
 }
 
 variable "extra_values_files" {
-  description = "Additional Helm values YAML files to merge (applied left-to-right, later files take precedence)"
+  description = "Optional advanced Helm values files, merged left-to-right after GPU profile defaults and before explicit gpu_tuning, placement, ingress, and TLS settings."
   type        = list(string)
   default     = []
 }

@@ -4,8 +4,13 @@ locals {
   supplied_certificate = local.supplied_tls ? file(var.tls_certificate_path) : ""
   supplied_private_key = var.tls_private_key_path != "" ? sensitive(file(var.tls_private_key_path)) : ""
   tls_common_name      = var.ingress_host != "" ? var.ingress_host : "fortiaigate.local"
-  internal_certificate = "${tls_locally_signed_cert.fortiaigate.cert_pem}${tls_self_signed_cert.ca.cert_pem}"
-  web_certificate      = local.supplied_tls ? local.supplied_certificate : local.internal_certificate
+  # Match Helm's left-to-right auth overrides for certificate authentication.
+  postgresql_username = merge(
+    yamldecode(file("${path.module}/fortiaigate/values.yaml")).postgresql.auth,
+    [for f in var.extra_values_files : try(yamldecode(file(f)).postgresql.auth, {})]...
+  ).username
+  internal_certificate = "${tls_locally_signed_cert.internal.cert_pem}${tls_self_signed_cert.ca.cert_pem}"
+  web_certificate      = local.supplied_tls ? local.supplied_certificate : "${tls_locally_signed_cert.fortiaigate.cert_pem}${tls_self_signed_cert.ca.cert_pem}"
   web_private_key      = local.supplied_tls ? local.supplied_private_key : tls_private_key.fortiaigate.private_key_pem
   web_trusted_root     = local.supplied_tls ? (var.tls_ca_certificate_path != "" ? file(var.tls_ca_certificate_path) : "") : tls_self_signed_cert.ca.cert_pem
 }
@@ -77,6 +82,32 @@ resource "tls_locally_signed_cert" "fortiaigate" {
 }
 
 
+resource "tls_private_key" "internal" {
+  algorithm = "RSA"
+  rsa_bits  = 2048
+}
+
+resource "tls_cert_request" "internal" {
+  private_key_pem = tls_private_key.internal.private_key_pem
+
+  subject {
+    # PostgreSQL cert authentication compares the client CN with the DB role.
+    common_name  = local.postgresql_username
+    organization = "FortiAIGate"
+  }
+
+  dns_names = tls_cert_request.fortiaigate.dns_names
+}
+
+resource "tls_locally_signed_cert" "internal" {
+  cert_request_pem   = tls_cert_request.internal.cert_request_pem
+  ca_private_key_pem = tls_private_key.ca.private_key_pem
+  ca_cert_pem        = tls_self_signed_cert.ca.cert_pem
+
+  validity_period_hours = 8760
+  allowed_uses          = ["key_encipherment", "digital_signature", "server_auth", "client_auth"]
+}
+
 resource "kubernetes_secret" "tls" {
   metadata {
     name      = "fortiaigate-tls-secret"
@@ -119,7 +150,7 @@ resource "kubernetes_secret" "internal_tls" {
   type = "kubernetes.io/tls"
   data = {
     "tls.crt" = local.internal_certificate
-    "tls.key" = tls_private_key.fortiaigate.private_key_pem
+    "tls.key" = tls_private_key.internal.private_key_pem
     "ca.crt"  = tls_self_signed_cert.ca.cert_pem
   }
 }

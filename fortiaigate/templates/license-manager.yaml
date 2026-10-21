@@ -125,6 +125,12 @@ spec:
         {{- if .Values.postgresql.tls.enabled }}
         - name: POSTGRES_SSL_ENABLED
           value: "true"
+        - name: POSTGRES_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_CA_CERTS
+          value: {{ printf "%s/%s" (include "fortiaigate.dbTlsMountPath" .) (include "fortiaigate.dbTlsCAFile" .) | quote }}
         {{- end }}
         # The guardrail dispatcher answers the accelerator inventory the
         # coverage verdict is computed from. Unset would mean the fleet cannot
@@ -163,19 +169,21 @@ spec:
         # read-only.
         - name: tmp
           mountPath: /tmp
-        {{- if or .Values.tls.enabled .Values.redis.tls.enabled }}
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
         - name: tls-certs
           mountPath: {{ .Values.tls.mountPath | quote }}
           readOnly: true
         {{- end }}
+      {{- include "fortiaigate.dbTlsVolumeMount" . | nindent 8 }}
       volumes:
       - name: tmp
         emptyDir: {}
-      {{- if or .Values.tls.enabled .Values.redis.tls.enabled }}
+      {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
       - name: tls-certs
         secret:
           secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
       {{- end }}
+      {{- include "fortiaigate.dbTlsVolume" . | nindent 6 }}
       {{- with .Values.fortiaigate.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

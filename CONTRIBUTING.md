@@ -47,7 +47,11 @@ terraform init -backend=false
 terraform validate
 tflint --recursive
 helm lint fortiaigate
+python3 scripts/test_tls.py
+python3 tests/check_gpu_tuning.py
 ```
+
+The isolated Terraform tests cover ingress, TLS, and GPU input validation using mocked providers. The GPU render check passes Terraform's composed values through Helm for G5, G6e, CPU-only, and explicit-override cases; it requires Helm and PyYAML and does not access AWS or local Terraform state.
 
 CI runs the same set on every PR (`.github/workflows/terraform.yml`).
 

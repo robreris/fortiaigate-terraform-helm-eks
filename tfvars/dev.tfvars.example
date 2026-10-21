@@ -21,7 +21,16 @@ app_node_count = 1
 # ---------------------------------------------------------------------------
 
 gpu_enabled            = true
-gpu_node_instance_type = "g6e.2xlarge"
+gpu_node_instance_type = "g5.2xlarge"
+gpu_tuning_profile     = "auto" # Selects shared A10G settings for G5; no YAML overlay.
+# Optional overrides; omit gpu_tuning to use the profile defaults.
+# gpu_tuning = {
+#   triton_memory_request = "12Gi"
+#   triton_memory_limit   = "25Gi"
+#   vllm_memory_request   = "8Gi"
+#   vllm_memory_limit     = "24Gi"
+#   vllm_max_num_seqs     = 64
+# }
 
 # ---------------------------------------------------------------------------
 # Ingress
@@ -55,7 +64,8 @@ efs_encrypted = false
 # ---------------------------------------------------------------------------
 # Licenses
 # ---------------------------------------------------------------------------
-# Upload a deployment license through POST /api/v1/admin/licenses after deployment.
+# Upload the deployment license in the WebUI after deployment (or use
+# POST /api/v1/admin/licenses). No license tfvars or follow-up apply is needed.
 
 # TLS: ALB frontend and pod web certificates are configured independently.
 # acm_certificate_arn = "arn:aws:acm:<region>:<account-id>:certificate/<id>"

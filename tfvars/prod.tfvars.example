@@ -21,6 +21,16 @@ image_tag    = "V8.0.2-build0055"
 
 gpu_enabled            = true
 gpu_node_instance_type = "g6e.2xlarge"
+gpu_tuning_profile     = "auto" # Retains vendor defaults for G6e.
+# To use G5, change only gpu_node_instance_type to "g5.2xlarge".
+# Optional explicit tfvars tuning takes precedence over profile/extra values:
+# gpu_tuning = {
+#   triton_memory_request = "12Gi"
+#   triton_memory_limit   = "25Gi"
+#   vllm_memory_request   = "8Gi"
+#   vllm_memory_limit     = "24Gi"
+#   vllm_max_num_seqs     = 64
+# }
 
 # ---------------------------------------------------------------------------
 # Ingress
@@ -49,7 +59,8 @@ efs_encrypted = true
 # ---------------------------------------------------------------------------
 # Licenses
 # ---------------------------------------------------------------------------
-# Upload a deployment license through POST /api/v1/admin/licenses after deployment.
+# Upload the deployment license in the WebUI after deployment (or use
+# POST /api/v1/admin/licenses). No license tfvars or follow-up apply is needed.
 
 # TLS: ALB frontend and pod web certificates are configured independently.
 # acm_certificate_arn = "arn:aws:acm:<region>:<account-id>:certificate/<id>"

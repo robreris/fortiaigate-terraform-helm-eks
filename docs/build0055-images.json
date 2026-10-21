@@ -1,0 +1,57 @@
+{
+  "release": "V8.0.2-build0055",
+  "chart_archive": "FAIG_helm_chart-V8.0.2-build0055-FORTINET.tar.gz",
+  "chart_archive_sha256": "98d06b08959731e276fc14b082d2a4a42a288ede5128b0d1f66a20a3d17206e7",
+  "images": [
+    {
+      "image": "api",
+      "tag": "V8.0.2-build0055",
+      "config_digest": "sha256:df647a0d994211be3603f056edb374bf34a51f43cef04c1fced9df1a92779684"
+    },
+    {
+      "image": "custom-triton",
+      "tag": "25.11-onnx-trt-agt-rpt-s1",
+      "config_digest": "sha256:f9cfa981387c8990e991bfa751d6ece466983574386ebabaf8cf9b4c7e271ac9"
+    },
+    {
+      "image": "faig-models",
+      "tag": "0.0.5-s1",
+      "config_digest": "sha256:5cc19cd9478f3f13adf7d1e200d723faedfb696d766d3b5d908436a48faa7c1b"
+    },
+    {
+      "image": "guardrail",
+      "tag": "V8.0.2-build0055",
+      "config_digest": "sha256:9b315efc2297a716dcc45ae0e5ac1d59d575526f97cb2d5a0cec9e46ffb74da7"
+    },
+    {
+      "image": "guardrail-scanner",
+      "tag": "V8.0.2-build0055",
+      "config_digest": "sha256:175d675dcde3d48b621cbc25f8766abd2a3c1896c0767054c36442c1d8469274"
+    },
+    {
+      "image": "license_manager",
+      "tag": "V8.0.2-build0055",
+      "config_digest": "sha256:5b509c96c77e4b79800f1a6b4945e1e2066666686ff6e08e4315d7bfc47de0b4"
+    },
+    {
+      "image": "llm-gateway",
+      "tag": "V8.0.2-build0055",
+      "config_digest": "sha256:e5a538603b6de0e67fe5f2b3bc113c12d4b440a39e98a155d51d03713eb2a0c1"
+    },
+    {
+      "image": "logd",
+      "tag": "V8.0.2-build0055",
+      "config_digest": "sha256:880bf1bbc6e67bd777232c54756b31a97f43a3f7b8f5214d350c3730865f222c"
+    },
+    {
+      "image": "vllm-server",
+      "tag": "0.28.0-rpt-s1",
+      "config_digest": "sha256:de3bc45e47156614469a315d75f5a2b33374185e5a12a5aa97f9f85b49d919ab"
+    },
+    {
+      "image": "webui",
+      "tag": "V8.0.2-build0055",
+      "config_digest": "sha256:56382fd1a45a478d26ca991465028f2f9b4eff91c2153670cb97359a6d761084"
+    }
+  ]
+}

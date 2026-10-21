@@ -13,8 +13,23 @@ run "internal_http" {
   command = apply
   variables { internal = true }
   assert {
+    condition     = tls_cert_request.internal.subject[0].common_name == "fortiaigate_postgres_user" && tls_cert_request.fortiaigate.subject[0].common_name == var.ingress_host && tls_cert_request.internal.dns_names == tls_cert_request.fortiaigate.dns_names
+    error_message = "Internal client CN must match the database role while preserving web CN and service SANs."
+  }
+  assert {
     condition     = yamldecode(local.ingress_annotation_values[0]).ingress.annotations["alb.ingress.kubernetes.io/scheme"] == "internal" && jsondecode(yamldecode(local.ingress_annotation_values[0]).ingress.annotations["alb.ingress.kubernetes.io/listen-ports"])[0].HTTP == 80
     error_message = "Internal mode without ACM must explicitly create a private HTTP listener."
+  }
+}
+
+run "internal_certificate_auth_overrides" {
+  command = apply
+  variables {
+    extra_values_files = ["tests/postgres-user.yaml", "tests/postgres-user-final.yaml"]
+  }
+  assert {
+    condition     = tls_cert_request.internal.subject[0].common_name == "final_user"
+    error_message = "Internal certificate must follow the last Helm database username override."
   }
 }
 

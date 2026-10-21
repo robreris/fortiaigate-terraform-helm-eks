@@ -59,6 +59,8 @@ You also need:
 
 ## Quickstart
 
+For an existing cluster managed by this stack, use one normal `terraform plan` / `terraform apply` with your tfvars. Upload deployment licenses afterward in the WebUI; no license values or follow-up Terraform apply are needed. The initial EKS bootstrap below is only for a new cluster, to make its Kubernetes API available to Terraform's Helm and Kubernetes providers.
+
 Pick a scenario from [`examples/`](./examples) — each one is a runnable `terraform.tfvars` snippet:
 
 | Scenario | Path |
@@ -102,7 +104,8 @@ terraform init -backend-config="$FAIG_BACKEND" -reconfigure
 terraform validate
 helm lint fortiaigate
 
-# Stage 1: create VPC, EKS, and node groups. Review the plan before confirming.
+# New cluster only: create VPC, EKS, and node groups. Review before confirming.
+# Skip this targeted bootstrap for subsequent deployments to this cluster.
 terraform apply -target=module.vpc -target=module.eks -var-file="$FAIG_VARS"
 
 # Configure kubectl and confirm API authorization and Ready nodes.
@@ -110,7 +113,8 @@ $(terraform output -raw configure_kubectl)
 kubectl get nodes
 kubectl wait --for=condition=Ready nodes --all --timeout=10m
 
-# Stage 2: create EFS, Secrets, controllers, device plugin, and application.
+# Deploy/update EFS, Secrets, controllers, device plugin, and application.
+# This is the normal single-apply workflow once EKS has been bootstrapped.
 terraform plan -var-file="$FAIG_VARS"
 terraform apply -var-file="$FAIG_VARS"
 
@@ -125,11 +129,13 @@ terraform output alb_dns_name
 terraform output ingress_scheme
 ```
 
-After applying, configure DNS for `ingress_host` using the ALB hostname: [Route 53 example](docs/route53-setup.md), or your public/private DNS provider. Private ALBs require a client on the VPC or a connected network. Open `https://<ingress_host>/ui` when ACM HTTPS is configured. Upload the deployment license through the authenticated admin API (`POST /api/v1/admin/licenses`), then test login, management API operations, and a policy-enforced LLM request with both DLP and POLICY detectors. Ready pods alone do not establish successful inference or license coverage.
+After applying, configure DNS for `ingress_host` using the ALB hostname: [Route 53 example](docs/route53-setup.md), or your public/private DNS provider. Private ALBs require a client on the VPC or a connected network. Open `https://<ingress_host>/ui` when ACM HTTPS is configured, sign in, and upload the deployment license in the WebUI. Automation can use the authenticated admin API (`POST /api/v1/admin/licenses`). No Terraform apply or Helm upgrade is needed after license upload. Then test management API operations and a policy-enforced LLM request with both DLP and POLICY detectors. Ready pods alone do not establish successful inference or license coverage.
 
 ## Two-step bootstrap (first deploy)
 
 The Helm and Kubernetes providers obtain credentials through `aws eks get-token`, but the cluster must already exist and authorize the caller before those providers can operate. Use the two stages above for a new cluster. `kubectl get nodes` checks API access; merely obtaining an EKS token does not prove authorization.
+
+This bootstrap is independent of licensing. The old node-bound license discovery/configuration workflow is gone; deployment licenses are uploaded in the WebUI after the application is deployed. Removing that license step does not remove the initial provider dependency on EKS. [HashiCorp's Kubernetes provider guidance](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs) recommends separate apply operations for cluster creation and Kubernetes resources.
 
 If stage 1 fails or nodes are not Ready, fix it before stage 2. If VPC creation was incomplete, re-run the VPC target using the same tfvars before retrying stage 1. Stage 2 can take longer than a few minutes while the large model images download and initialize; the application's Helm timeout is 20 minutes.
 
@@ -157,7 +163,7 @@ The bundled chart is FortiAIGate 8.0.2 build0055. Before applying:
 
 1. Back up PostgreSQL, Redis, the shared EFS data, Helm values, and Secrets. Preserve the master-key Secret on subsequent upgrades; encrypted credentials depend on it.
 2. Mirror all ten supplied image archives into your registry using [docs/images.md](./docs/images.md). The inference images use fixed tags.
-3. Set `image_tag = "V8.0.2-build0055"`, remove node-keyed `licenses`, and remove any explicit `gpu_node_instance_type = "g5.2xlarge"` override (or set it to `g6e.2xlarge`). Review old extra values files against the new chart; `core` and `scanners` have been replaced by `llmGateway` and `guardrail`.
+3. Set `image_tag = "V8.0.2-build0055"` and remove node-keyed `licenses`. Use the default `g6e.2xlarge`, or retain `g5.2xlarge` with [automatic G5 tuning](#gpu-support). Review old extra values files against the new chart; `core` and `scanners` have been replaced by `llmGateway` and `guardrail`.
 4. Review `terraform plan`. Changing the GPU instance type replaces the managed node group; schedule downtime for inference. Apply the upgrade, upload the deployment license, and check all pods become Ready.
 5. Update LLM clients to the `/ai` gateway routes. The console uses `/ui`; the management API remains under `/api/`.
 
@@ -167,15 +173,51 @@ The `Recreate` strategy avoids waiting for a second GPU during rollout. Local va
 
 ## License management
 
-FortiAIGate 8.0.2 uses deployment licenses stored in PostgreSQL. Upload a license through the authenticated admin API (`POST /api/v1/admin/licenses`) after deployment. The license manager runs as a two-replica Deployment.
+FortiAIGate 8.0.2 uses deployment licenses stored in PostgreSQL. After deployment, sign in to the WebUI and upload the license. Automation can use the authenticated admin API (`POST /api/v1/admin/licenses`). The license manager runs as a two-replica Deployment.
 
-Remove the old node-keyed `licenses` map from your tfvars. The deprecated variable accepts only an empty map; Terraform no longer creates a license ConfigMap or pins services to licensed nodes.
+Remove the old node-keyed `licenses` map from your tfvars. The deprecated variable accepts only an empty map; Terraform no longer creates a license ConfigMap or pins services to licensed nodes. Do not discover node IDs or add license material to Terraform configuration. Uploading or renewing a license does not require Terraform or Helm changes. The initial EKS bootstrap described above is a separate infrastructure dependency.
 
 ---
 
 ## GPU support
 
 Disabled by default. Set `gpu_enabled = true` to add a single `g6e.2xlarge` node on the `AL2023_x86_64_NVIDIA` AMI, tainted `fortiaigate-gpu=true:NoSchedule`. Triton and vLLM share its GPU in one pod (`triton-vllm-server`). Application nodes retain the `m7i.4xlarge` default.
+
+To use a `g5.2xlarge`, configure only your deployment tfvars:
+
+```hcl
+gpu_enabled            = true
+gpu_node_instance_type = "g5.2xlarge"
+gpu_tuning_profile     = "auto"
+```
+
+`auto` selects the maintained reference chart's shared A10G settings for G5 instances. Other instance families retain the vendor defaults. Set `gpu_tuning_profile = "g5"` to explicitly select those settings, or `"chart"` to disable automatic tuning. CPU-only deployments omit GPU tuning entirely.
+
+| G5 setting | Triton | vLLM |
+|------------|--------|------|
+| Host RAM request | 12 GiB | 8 GiB |
+| Host RAM limit | 25 GiB | 24 GiB |
+| Model instances / API processes | 1 | 1 |
+| Maximum batch / concurrent sequences | 16 | 64 |
+| GPU budget | Shares the remaining GPU memory | 80% |
+
+The combined 20 GiB memory request fits a G5 node. Limits permit model startup to use more memory and exceed the node's total RAM when added together; simultaneous peaks can still exhaust the node. Validate model startup and inference under your workload, checking for `OOMKilled`, CUDA memory errors, and insufficient KV cache. Retaining the existing instance type avoids replacing its node group.
+
+Optional overrides also live in tfvars; omitted fields inherit their profile/chart defaults:
+
+```hcl
+gpu_tuning = {
+  triton_memory_request = "12Gi"
+  triton_memory_limit   = "25Gi"
+  vllm_memory_request   = "8Gi"
+  vllm_memory_limit     = "24Gi"
+  vllm_max_num_seqs     = 32
+}
+```
+
+`gpu_tuning` also supports `triton_dlp_instances_per_gpu`, `triton_dlp_max_batch_size`, `vllm_api_server_count`, `vllm_gpu_memory_utilization`, and `vllm_max_model_len`. Memory quantities must use positive whole `Mi` or `Gi` units. When changing context length, review the policy scanner's chunk/rule lengths together with it, as described in the chart values. `extra_values_files` remains optional for advanced chart settings. Merge precedence is profile defaults → extra values files → explicit `gpu_tuning` fields → mandatory placement/ingress/TLS → Helm `set` values.
+
+If you used the earlier `values-g5.yaml`, remove its entry from `extra_values_files` and set `gpu_tuning_profile = "auto"`. Keep any unrelated files. The old overlay's 6 GiB Triton limit caused startup OOM kills; the reference settings restore its 25 GiB limit.
 
 Terraform also installs the [NVIDIA Kubernetes device plugin](https://github.com/NVIDIA/k8s-device-plugin) as a Helm release in `kube-system` with matching tolerations — no manual setup needed. Without the device plugin, Triton pods stay `Pending` with `Insufficient nvidia.com/gpu`.
 
@@ -297,7 +339,7 @@ The separately bootstrapped S3 state bucket and DynamoDB lock table, mirrored EC
 
 ## Troubleshooting
 
-**`Unauthorized` on first apply** — You skipped the two-step bootstrap. See [Two-step bootstrap](#two-step-bootstrap-first-deploy).
+**`Unauthorized` on first apply** — Confirm the intended AWS identity, EKS access permissions, and `kubectl get nodes` access. For a new cluster, complete the [initial EKS bootstrap](#two-step-bootstrap-first-deploy) before applying Helm/Kubernetes resources. This is independent of application licensing.
 
 **Node groups stuck in `Creating` for 20+ minutes** — Nodes booted but can't register with the control plane. Most common cause: incomplete VPC (no NAT gateway, no public subnets, missing default route). Check `aws ec2 describe-nat-gateways` and the private subnet route tables. If the VPC is partial, re-run `terraform apply -target=module.vpc` first.
 
@@ -311,7 +353,11 @@ kubectl get pvc -n fortiaigate
 kubectl get pods -n kube-system | grep efs
 ```
 
-**License manager not starting** — Check its Deployment logs and PostgreSQL/Redis connectivity. Licenses are uploaded through the admin API, rather than node-mounted files.
+**`Insufficient memory` for `triton-vllm-server`** — Vendor chart defaults request 36 GiB of host RAM (12 GiB + 24 GiB), so a 32 GiB `g5.2xlarge` cannot schedule them. Keep `gpu_tuning_profile = "auto"` to use the [G5 defaults](#gpu-support), and inspect explicit overrides or extra values files if requests still exceed node capacity. Review a full plan before applying; changing instance type replaces the GPU node group. Successful scheduling still requires live model-startup verification.
+
+**PostgreSQL `certificate authentication failed`** — PostgreSQL compares the client certificate CN with the database username. Apply the current TLS configuration, which issues a separate internal certificate with CN matching `postgresql.auth.username`, and the updated license-manager template with explicit database certificate paths. Use the same backend and tfvars, review the full plan, then apply. Internal certificate checksums roll database servers and clients; allow those rollouts to finish before verifying API, gateway, and license-manager readiness. Back up existing application data before the rollout. No database or EFS deletion is needed. See [certificate behavior](docs/ingress-and-tls.md#web-and-internal-certificates).
+
+**License manager not starting** — Check its Deployment logs and PostgreSQL connectivity, including client certificate errors above. Licenses are uploaded through the admin API, rather than node-mounted files.
 
 ---
 
@@ -389,9 +435,12 @@ The block below is regenerated by [terraform-docs](https://terraform-docs.io/) v
 | [kubernetes_storage_class.efs](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/resources/storage_class) | resource |
 | [terraform_data.ingress_configuration](https://registry.terraform.io/providers/hashicorp/terraform/latest/docs/resources/data) | resource |
 | [tls_cert_request.fortiaigate](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/cert_request) | resource |
+| [tls_cert_request.internal](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/cert_request) | resource |
 | [tls_locally_signed_cert.fortiaigate](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/locally_signed_cert) | resource |
+| [tls_locally_signed_cert.internal](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/locally_signed_cert) | resource |
 | [tls_private_key.ca](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/private_key) | resource |
 | [tls_private_key.fortiaigate](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/private_key) | resource |
+| [tls_private_key.internal](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/private_key) | resource |
 | [tls_self_signed_cert.ca](https://registry.terraform.io/providers/hashicorp/tls/latest/docs/resources/self_signed_cert) | resource |
 | [aws_availability_zones.available](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/availability_zones) | data source |
 | [kubernetes_ingress_v1.fortiaigate](https://registry.terraform.io/providers/hashicorp/kubernetes/latest/docs/data-sources/ingress_v1) | data source |
@@ -410,10 +459,12 @@ The block below is regenerated by [terraform-docs](https://terraform-docs.io/) v
 | <a name="input_cluster_name"></a> [cluster\_name](#input\_cluster\_name) | EKS cluster name | `string` | `"fortiaigate"` | no |
 | <a name="input_cluster_version"></a> [cluster\_version](#input\_cluster\_version) | Kubernetes version for the EKS cluster | `string` | `"1.31"` | no |
 | <a name="input_efs_encrypted"></a> [efs\_encrypted](#input\_efs\_encrypted) | Encrypt the EFS file system at rest with a KMS key. Disable if no suitable KMS key is available in the account. | `bool` | `true` | no |
-| <a name="input_extra_values_files"></a> [extra\_values\_files](#input\_extra\_values\_files) | Additional Helm values YAML files to merge (applied left-to-right, later files take precedence) | `list(string)` | `[]` | no |
+| <a name="input_extra_values_files"></a> [extra\_values\_files](#input\_extra\_values\_files) | Optional advanced Helm values files, merged left-to-right after GPU profile defaults and before explicit gpu\_tuning, placement, ingress, and TLS settings. | `list(string)` | `[]` | no |
 | <a name="input_gpu_enabled"></a> [gpu\_enabled](#input\_gpu\_enabled) | Add a GPU node group (g6e.2xlarge) for Triton and vLLM inference. When false, GPU inference is disabled; POLICY detectors fail closed. | `bool` | `false` | no |
 | <a name="input_gpu_node_ami_type"></a> [gpu\_node\_ami\_type](#input\_gpu\_node\_ami\_type) | EKS managed node group AMI type for GPU nodes. Use AL2023\_x86\_64\_NVIDIA for CUDA 13+ container compatibility. | `string` | `"AL2023_x86_64_NVIDIA"` | no |
 | <a name="input_gpu_node_instance_type"></a> [gpu\_node\_instance\_type](#input\_gpu\_node\_instance\_type) | EC2 instance type for the GPU node group | `string` | `"g6e.2xlarge"` | no |
+| <a name="input_gpu_tuning"></a> [gpu\_tuning](#input\_gpu\_tuning) | Optional inference overrides in tfvars. Unset fields inherit profile/chart values. Memory uses whole Mi/Gi quantities. Explicit fields override extra\_values\_files. | <pre>object({<br/>    triton_memory_request        = optional(string)<br/>    triton_memory_limit          = optional(string)<br/>    triton_dlp_instances_per_gpu = optional(number)<br/>    triton_dlp_max_batch_size    = optional(number)<br/>    vllm_memory_request          = optional(string)<br/>    vllm_memory_limit            = optional(string)<br/>    vllm_max_num_seqs            = optional(number)<br/>    vllm_api_server_count        = optional(number)<br/>    vllm_gpu_memory_utilization  = optional(number)<br/>    vllm_max_model_len           = optional(number)<br/>  })</pre> | `{}` | no |
+| <a name="input_gpu_tuning_profile"></a> [gpu\_tuning\_profile](#input\_gpu\_tuning\_profile) | Inference defaults: auto selects g5 for G5 instances and chart otherwise; g5 uses shared A10G reference settings; chart retains vendor defaults. | `string` | `"auto"` | no |
 | <a name="input_image_tag"></a> [image\_tag](#input\_image\_tag) | Image tag for all FortiAIGate service images | `string` | `"V8.0.2-build0055"` | no |
 | <a name="input_ingress_annotations"></a> [ingress\_annotations](#input\_ingress\_annotations) | Additional ingress annotations. ALB scheme must agree with internal; acm\_certificate\_arn takes precedence over its annotation. Keys with dots/slashes are handled via values YAML merge. | `map(string)` | `{}` | no |
 | <a name="input_ingress_class"></a> [ingress\_class](#input\_ingress\_class) | Ingress class name. Use 'nginx' for nginx-ingress or 'alb' for AWS Load Balancer Controller. | `string` | `"nginx"` | no |

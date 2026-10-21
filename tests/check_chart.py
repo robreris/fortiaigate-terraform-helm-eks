@@ -1,19 +1,13 @@
 """Render upgrade-critical configurations. Requires helm and PyYAML."""
 from pathlib import Path
+import json
 import subprocess
 import yaml
 
 CHART = Path(__file__).resolve().parents[1] / "fortiaigate"
 REPO = "example.com/fortiaigate"
-TAGS = {
-    **dict.fromkeys([
-        "api", "llm-gateway", "webui", "logd", "license_manager",
-        "guardrail", "guardrail-scanner",
-    ], "V8.0.2-build0055"),
-    "custom-triton": "25.11-onnx-trt-agt-rpt-s1",
-    "vllm-server": "0.28.0-rpt-s1",
-    "faig-models": "0.0.5-s1",
-}
+INVENTORY = json.loads((CHART.parent / "docs/build0055-images.json").read_text())
+TAGS = {image["image"]: image["tag"] for image in INVENTORY["images"]}
 
 for mode in ("cpu", "shared", "dedicated"):
     args = ["helm", "template", "fortiaigate", str(CHART), "--namespace", "fortiaigate"]

@@ -66,12 +66,15 @@ export AWS_PROFILE=dev   # or set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
 # 2. Initialize (first time on this machine, or when switching accounts)
 terraform init -backend-config=backends/dev.hcl -reconfigure
 
-# 3. First deploy: bootstrap AWS infrastructure before Helm/Kubernetes resources.
+# 3. New cluster only: bootstrap AWS infrastructure before Helm/Kubernetes.
+# Skip this step for updates to an existing cluster.
 terraform apply -target=module.vpc -target=module.eks -var-file=tfvars/dev.tfvars
 
-# 4. Plan / apply the rest (also the normal workflow for later updates).
+# 4. Plan / apply the application (the single-apply workflow for later updates).
 terraform plan -var-file=tfvars/dev.tfvars
 terraform apply -var-file=tfvars/dev.tfvars
 ```
+
+Upload deployment licenses in the WebUI after deployment; no follow-up Terraform apply is required for licensing. The new-cluster bootstrap exists so Terraform's Kubernetes and Helm providers can reach EKS, independently of how licenses are managed.
 
 Use `-reconfigure` (not `-migrate-state`) when switching between accounts — you are pointing at a different backend, not copying state between them.

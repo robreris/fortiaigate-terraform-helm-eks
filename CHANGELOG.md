@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Clarify that deployment licenses are uploaded in the WebUI without a follow-up Terraform apply; distinguish this from the first-deploy EKS provider bootstrap and document a single normal apply for existing clusters.
+
+- Record build0055 chart/archive image fingerprints and use the verified inventory in chart render checks; document exact GPU image matches for registries using content-suffixed tags.
+
+- Add automatic G5 inference defaults and validated `gpu_tuning` overrides in tfvars, replacing the temporary YAML overlay. Use the maintained reference chart's 12/8 GiB memory requests and 25/24 GiB limits to address Triton startup OOM kills; preserve advanced Helm overrides and document memory overcommit. Update development, production, and scenario samples.
+
+- Fix PostgreSQL certificate authentication with a separate internal key/certificate whose CN matches the Helm database username; retain independent web TLS and existing Terraform resource addresses. Supply the license manager's database client certificate paths and mounts.
+- Document recovery from database certificate failures and GPU scheduling failures on 32 GiB nodes.
+
 - Advance Terraform/chart image defaults, development/production tfvars examples, render checks, and image/deployment documentation to FortiAIGate 8.0.2 build0055. The vendor chart and pinned GPU image versions are unchanged from build0054; document the exact registry tags required.
 
 - Replace `CLAUDE.md` with concise repository guidance in `AGENTS.md`; move AWS Terraform and Helm implementation notes into `docs/technical-notes.md`.

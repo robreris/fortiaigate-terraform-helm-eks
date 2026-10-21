@@ -18,6 +18,11 @@ aws_load_balancer_controller_enabled = true
 gpu_enabled    = false
 app_node_count = 2
 
+# For full inference on a G5, set gpu_enabled = true. Auto supplies memory and
+# concurrency settings from the maintained shared A10G reference configuration.
+gpu_node_instance_type = "g5.2xlarge"
+gpu_tuning_profile     = "auto"
+
 # Recommended for console/API HTTPS (certificate must be in aws_region):
 # ingress_host        = "fortiaigate.corp.example.com"
 # acm_certificate_arn = "arn:aws:acm:us-west-2:123456789012:certificate/<id>"

@@ -52,12 +52,13 @@ for controller in ("alb", "nginx"):
         volumes = {v["name"]: v for v in pod.get("volumes", [])}
         serving_secret = "web-tls" if name in ("api", "llm-gateway", "webui") else "internal-tls"
         assert volumes["tls-certs"]["secret"]["secretName"] == serving_secret, name
-        if name in ("api", "llm-gateway", "logd"):
+        if name in ("api", "llm-gateway", "logd", "license-manager"):
             assert volumes["internal-tls-certs"]["secret"]["secretName"] == "internal-tls"
             env = {e["name"]: e.get("value") for e in pod["containers"][0]["env"]}
-            for db in ("REDIS", "POSTGRES"):
+            for db in (("POSTGRES",) if name == "license-manager" else ("REDIS", "POSTGRES")):
                 assert env[f"{db}_SSL_CA_CERTS"] == "/etc/internal-tls/ca.crt", name
                 assert env[f"{db}_SSL_CERTFILE"] == "/etc/internal-tls/tls.crt", name
+                assert env[f"{db}_SSL_KEYFILE"] == "/etc/internal-tls/tls.key", name
             mounts = pod["containers"][0]["volumeMounts"]
             assert any(m["name"] == "internal-tls-certs" and m["mountPath"] == "/etc/internal-tls" for m in mounts)
         changed = template["metadata"]["annotations"] != rotated[name]["metadata"]["annotations"]

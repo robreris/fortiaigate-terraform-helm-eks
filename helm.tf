@@ -119,9 +119,10 @@ resource "helm_release" "fortiaigate" {
   ]
 
   # Values are merged left-to-right; later entries take precedence.
-  # User-supplied extra_values_files go first so gpu and annotation overrides win.
+  # Advanced files override profile defaults; explicit tfvars tuning and
+  # mandatory placement/ingress/TLS settings take precedence over those files.
   values = concat(
-    [for f in var.extra_values_files : file(f)],
+    local.gpu_helm_values,
     local.gpu_values,
     local.ingress_annotation_values,
     local.tls_values,

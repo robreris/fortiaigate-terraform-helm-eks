@@ -2,6 +2,8 @@
 
 FortiAIGate 8.0.2 build0055 uses the following images under `var.image_repository`. The tags below were verified against the Docker manifests in the supplied 8.0.2 build0055 archives.
 
+[build0055-images.json](build0055-images.json) records the supplied chart archive SHA-256 and the full image configuration digests from all ten Docker archives. Chart render checks use this inventory for their expected image tags. The local chart retains the vendor image references alongside the EKS scheduling, ingress, and Terraform-managed TLS adaptations; `gpu_tuning_profile` and `gpu_tuning` in tfvars adjust runtime sizing independently.
+
 | Image | Tag | Use |
 |-------|-----|-----|
 | api | V8.0.2-build0055 | Management API |
@@ -23,6 +25,16 @@ the content-derived hash suffixes used by the separate daily-update workflow.
 When reusing a registry populated by that workflow, also publish the images
 under the exact tags above. Changing `image_tag` affects only the seven
 application images.
+
+When adding vendor tag aliases to an existing ECR repository, verify the ECR image manifest's `config.digest` against the archive's `config_digest` in the inventory first. This identifies the supplied image even when several registry tags share a version prefix. For build0055, the matching suffixed GPU tags are:
+
+| Image | Matching existing tag |
+|-------|-----------------------|
+| custom-triton | `25.11-onnx-trt-agt-rpt-s1-f9cfa981387c` |
+| vllm-server | `0.28.0-rpt-s1-de3bc45e4715` |
+| faig-models | `0.0.5-s1-5cc19cd9478f` |
+
+The suffixes above are configuration digest prefixes, not ECR manifest digests. After verification, add the exact vendor tag from the inventory to the matching ECR manifest. Keep existing suffixed tags; no layer upload or chart tag change is needed. Kubernetes retries image pulls automatically once the required tags are available.
 
 The old `core`, `scanner`, and `triton-models` images are no longer used.
 

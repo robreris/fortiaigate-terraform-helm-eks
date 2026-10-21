@@ -49,7 +49,9 @@ Terraform creates a per-deployment CA and a serving certificate covering the ing
 - `fortiaigate-tls-secret`: API, LLM gateway, WebUI, and the nginx frontend.
 - `fortiaigate-internal-tls-secret`: guardrail services, LogD, license manager, PostgreSQL, Redis, and database client mounts. Its `ca.crt` is the generated CA.
 
-With the default generated web certificate, both Secrets contain the generated serving chain. To supply a web certificate independently:
+The Secrets use separate keys and leaf certificates signed by the same generated CA. The internal certificate's common name matches `postgresql.auth.username` (default `fortiaigate_postgres_user`), including overrides from `extra_values_files`, because PostgreSQL uses certificate authentication. Its DNS SANs cover the same service names for server verification. Database clients, including the license manager, receive explicit certificate, key, and CA paths. Changing the ingress hostname does not change the database identity.
+
+To supply a web certificate independently:
 
 ```hcl
 ingress_host            = "fortiaigate.example.com"

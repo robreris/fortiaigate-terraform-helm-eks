@@ -31,5 +31,15 @@ ingress_annotations = {
 gpu_enabled    = true
 app_node_count = 2
 
+gpu_node_instance_type = "g5.2xlarge"
+gpu_tuning_profile     = "auto"
+# Optional overrides stay in this tfvars file; no additional values YAML needed.
+# gpu_tuning = {
+#   triton_memory_request = "12Gi"
+#   triton_memory_limit   = "25Gi"
+#   vllm_memory_request   = "8Gi"
+#   vllm_memory_limit     = "24Gi"
+# }
+
 # Alternatively, use acm_certificate_arn instead of the certificate-arn annotation.
 # See docs/ingress-and-tls.md for web/internal certificate separation.
