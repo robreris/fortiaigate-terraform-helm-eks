@@ -1,5 +1,5 @@
 # Dev account — copy to tfvars/dev.tfvars and fill in real values.
-# Usage: terraform apply -var-file=tfvars/dev.tfvars
+# Deployment/bootstrap: README.md. Teardown: docs/teardown.md.
 
 # ---------------------------------------------------------------------------
 # Required
@@ -38,10 +38,8 @@ gpu_tuning_profile     = "auto" # Selects shared A10G settings for G5; no YAML o
 
 aws_load_balancer_controller_enabled = true
 ingress_class                        = "alb"
-#internal                             = false   # internal ALB for dev; no ACM cert needed
-#ingress_host                         = ""
-
-#For internet-facing ALB with HTTPS, uncomment and fill in:
+# Public HTTPS example; replace the hostname and certificate ARN.
+# For private HTTP evaluation, use examples/internal-alb/terraform.tfvars.
 internal     = false
 ingress_host = "fortiaigate.example.com"
 ingress_annotations = {

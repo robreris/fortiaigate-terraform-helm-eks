@@ -4,7 +4,7 @@ Deploy FortiAIGate 8.0.2 build0055 with Terraform and the bundled Helm chart. Th
 
 ## Before you start
 
-- Install Terraform 1.9+, AWS CLI v2, Helm 3, and kubectl compatible with your cluster version (default: 1.31).
+- Install Terraform 1.9+, AWS CLI v2, Helm 3, and kubectl compatible with your cluster version (default: 1.31). Check the [EKS version support note](docs/deployment-guide.md#eks-version-support) before creating a cluster.
 - Configure AWS credentials with permission to create VPC, EKS, EC2, EFS, and IAM resources. This deployment creates billable AWS resources, including GPU instances when enabled.
 - Obtain the entitled FortiAIGate images and a deployment license from Fortinet. [Push the required images to your registry](docs/images.md) before applying.
 - [Create an S3 state bucket and DynamoDB lock table](docs/remote-state.md) once for your account.

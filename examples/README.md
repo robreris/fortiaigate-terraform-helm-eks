@@ -4,21 +4,9 @@ Each subdirectory holds a `terraform.tfvars` snippet illustrating a deployment s
 
 ## Running an example
 
-```bash
-# From the repo root, with the appropriate backend already initialized:
-terraform init -backend-config=backends/<account>.hcl -reconfigure
+Follow the [root quickstart](../README.md#quickstart), copying your chosen scenario to a gitignored `tfvars/<name>.tfvars` file before editing it. Use the Terraform stack at the repository root and a backend state key unique to the deployment. Confirm Ready nodes after the initial bootstrap before applying the application.
 
-# New cluster only: bootstrap VPC + EKS so the providers can authenticate.
-# Skip this command for updates to an already bootstrapped cluster.
-terraform apply -target=module.vpc -target=module.eks \
-  -var-file=examples/<name>/terraform.tfvars
-
-# Deploy the application, or update an existing deployment with one normal apply.
-terraform plan -var-file=examples/<name>/terraform.tfvars
-terraform apply -var-file=examples/<name>/terraform.tfvars
-```
-
-After deploying, sign in to the WebUI and upload the deployment license. This requires no license tfvars, node-ID discovery, or second license-related apply. The initial cluster bootstrap above is required for provider connectivity and is independent of licensing.
+Upload the deployment license in the WebUI after deployment. No license tfvars, node-ID discovery, or follow-up Terraform apply is needed. For removal, use the [staged teardown](../docs/teardown.md).
 
 ## Scenarios
 

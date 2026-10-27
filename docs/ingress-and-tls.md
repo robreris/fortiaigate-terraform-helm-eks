@@ -79,7 +79,7 @@ For an existing deployment, the new generated CA and separate internal Secret ch
 
 ## Deploy and verify
 
-Follow the README's two-stage bootstrap. Choose exposure before the first apply; changing the scheme later may replace the ALB and its DNS name, and requires a rollout window and DNS updates.
+Follow the [README quickstart](../README.md#quickstart): bootstrap EKS, then apply the application. Choose exposure before the first apply; changing the scheme later may replace the ALB and its DNS name, and requires a rollout window and DNS updates.
 
 After the full apply:
 
@@ -93,6 +93,6 @@ kubectl logs -n kube-system deployment/aws-load-balancer-controller --tail=100
 
 Point `ingress_host` to the ALB hostname in the DNS clients use. Private DNS must resolve from the connected network; this stack does not create VPN/peering connectivity or DNS records. ALB addresses can change; use aliases or CNAMEs rather than pinning the resolved IPs. Verify `/ui`, authenticated API calls, and inference from a client on the correct network. Check target-group health for all three backends in AWS.
 
-For access before ingress/DNS is ready, `node scripts/ui-proxy.mjs` creates local port-forwards and serves the UI, API, and `/ai` on one HTTPS origin. It uses your current kubeconfig, binds to localhost, and does not test ALB reachability or DNS. Use `FAIG_NAMESPACE` to select a different namespace.
+For access before ingress/DNS is ready, `node scripts/ui-proxy.mjs` creates local port-forwards and serves the UI, API, and `/ai` on one HTTPS origin. It uses your current kubeconfig, binds to localhost, and does not test ALB reachability or DNS. It requires Node.js and OpenSSL; open `https://localhost:8443/ui` and trust its local self-signed certificate for evaluation. Export `FAIG_NAMESPACE` to select a different namespace.
 
-Offline validation: `helm lint fortiaigate`, `python3 tests/check_chart.py`, `python3 tests/check_ingress_tls.py`, `python3 -m unittest discover -s tests -p test_tls_material.py`, and `python3 scripts/test_tls.py` (Terraform 1.7+ with initialized providers). The last command uses a temporary configuration with mocked providers and reads no account tfvars or state. Live AWS behavior remains to be tested.
+Offline validation: `helm lint fortiaigate`, `python3 tests/check_chart.py`, `python3 tests/check_ingress_tls.py`, `python3 -m unittest discover -s tests -p test_tls_material.py`, and `python3 scripts/test_tls.py` (Terraform 1.9+ with initialized providers). The last command uses a temporary configuration with mocked providers and reads no account tfvars or state. These offline checks do not verify live ALB reachability, inference, or teardown.

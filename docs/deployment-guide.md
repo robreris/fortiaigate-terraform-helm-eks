@@ -27,6 +27,10 @@ AWS
 | PostgreSQL | Bitnami subchart |
 | Redis | Bitnami subchart |
 
+## EKS version support
+
+The configured default is Kubernetes `1.31`. As of October 27, 2026, it is in EKS extended support: standard support ended November 26, 2025, and extended support ends November 26, 2026. Check the [AWS support calendar](https://docs.aws.amazon.com/eks/latest/userguide/kubernetes-versions.html) before a new deployment and set `cluster_version` in tfvars to your validated target version. This branch has not established compatibility with newer versions; validate chart, add-on, node AMI, and GPU runtime compatibility before upgrading.
+
 ## Two-step bootstrap (first deploy)
 
 The Helm and Kubernetes providers obtain credentials through `aws eks get-token`, but the cluster must already exist and authorize the caller before those providers can operate. Use the two stages in the [quickstart](../README.md#quickstart) for a new cluster. `kubectl get nodes` checks API access; merely obtaining an EKS token does not prove authorization.
@@ -35,7 +39,7 @@ This bootstrap is independent of licensing. The old node-bound license discovery
 
 If stage 1 fails or nodes are not Ready, fix it before stage 2. If VPC creation was incomplete, re-run the VPC target using the same tfvars before retrying stage 1. Stage 2 can take longer than a few minutes while the large model images download and initialize; the application's Helm timeout is 20 minutes.
 
-Subsequent configuration changes normally use a full `terraform plan` and `terraform apply` with the same variable file. Targeting is reserved for this bootstrap and the [staged teardown](teardown.md). Local checks have passed, but the documented fresh deployment and teardown sequence still requires a live AWS test.
+Subsequent configuration changes normally use a full `terraform plan` and `terraform apply` with the same variable file. Targeting is reserved for this bootstrap and the [staged teardown](teardown.md). A healthy EKS bootstrap does not establish application readiness or validate the full teardown; verify each stage separately.
 
 ## Updating from build0054 to build0055
 
@@ -134,11 +138,11 @@ All three services share the same listener via path-based routing:
 
 | Caller | Path | Backend |
 |--------|------|---------|
-| FortiGate → WebUI | `/ui` and `/` | webui (port 3000) |
+| Browser / FortiGate integration | `/ui` | webui (port 3000) |
 | Chatbot → API | `/api/` | api (port 8000) |
 | Chatbot → LLM gateway | `/ai` | llm-gateway (port 8080) |
 
-See [`examples/`](../examples) for full annotation blocks for each scenario.
+The Ingress also routes `/` to WebUI, but use `/ui` as the console entry point; routing to WebUI does not guarantee a root redirect. See [`examples/`](../examples) for annotation blocks for each scenario.
 
 ## Advanced: extra values files
 

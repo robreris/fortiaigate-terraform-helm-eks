@@ -1,6 +1,6 @@
 # Remote state (S3 + DynamoDB)
 
-State is stored in S3 with one bucket and one DynamoDB lock table per AWS account. This keeps state isolated — switching accounts only requires switching AWS credentials.
+State is stored in S3 with a DynamoDB lock table. Select the matching AWS credentials, backend configuration, and tfvars together when switching accounts. Multiple deployments can share a bucket and lock table, but each needs its own state key. Switching Git branches does not change remote state; applying different branch configuration against the same key changes the same deployment.
 
 ## One-time bootstrap per account
 
@@ -9,7 +9,7 @@ Run these commands once with credentials for the target account active. Choose a
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 BUCKET="fortiaigate-tfstate-${ACCOUNT_ID}"
-REGION="us-west-2"   # match the region you will deploy into
+REGION="us-west-2"   # state backend region; match backends/dev.hcl
 
 # S3 bucket (us-east-1 is the S3 default region and rejects LocationConstraint)
 if [ "${REGION}" = "us-east-1" ]; then
@@ -18,12 +18,12 @@ else
   aws s3api create-bucket --bucket "${BUCKET}" --region "${REGION}" \
     --create-bucket-configuration LocationConstraint="${REGION}"
 fi
-aws s3api put-bucket-versioning --bucket "${BUCKET}" \
+aws s3api put-bucket-versioning --bucket "${BUCKET}" --region "${REGION}" \
   --versioning-configuration Status=Enabled
-aws s3api put-bucket-encryption --bucket "${BUCKET}" \
+aws s3api put-bucket-encryption --bucket "${BUCKET}" --region "${REGION}" \
   --server-side-encryption-configuration \
   '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
-aws s3api put-public-access-block --bucket "${BUCKET}" \
+aws s3api put-public-access-block --bucket "${BUCKET}" --region "${REGION}" \
   --public-access-block-configuration \
   "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
 
@@ -34,6 +34,7 @@ aws dynamodb create-table \
   --key-schema AttributeName=LockID,KeyType=HASH \
   --billing-mode PAY_PER_REQUEST \
   --region "${REGION}"
+aws dynamodb wait table-exists --table-name terraform-state-lock --region "${REGION}"
 ```
 
 ## Backend config files
@@ -76,5 +77,7 @@ terraform apply -var-file=tfvars/dev.tfvars
 ```
 
 Upload deployment licenses in the WebUI after deployment; no follow-up Terraform apply is required for licensing. The new-cluster bootstrap exists so Terraform's Kubernetes and Helm providers can reach EKS, independently of how licenses are managed.
+
+After bootstrap, refresh kubectl and verify Ready nodes as shown in the [quickstart](../README.md#quickstart) before the full apply. For removal, follow the [staged teardown](teardown.md); the state bucket and lock table remain outside the stack.
 
 Use `-reconfigure` (not `-migrate-state`) when switching between accounts — you are pointing at a different backend, not copying state between them.

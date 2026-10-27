@@ -28,7 +28,7 @@ fortiaigate:
     # Specify your container registry address and image tag.
     # Example:
     # repository: 192.168.0.1:5000
-    # tag: v8.0.0-build0001
+    # tag: V8.0.2-build0055
     repository: ""
     tag: "V8.0.2-build0055"
     pullPolicy: IfNotPresent

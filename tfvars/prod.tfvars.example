@@ -1,5 +1,6 @@
 # Prod account — copy to tfvars/prod.tfvars and fill in real values.
-# Usage: terraform apply -var-file=tfvars/prod.tfvars
+# Deployment/bootstrap: README.md. Review SECURITY.md before production use.
+# Teardown: docs/teardown.md.
 
 # ---------------------------------------------------------------------------
 # Required

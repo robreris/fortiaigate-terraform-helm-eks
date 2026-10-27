@@ -1,6 +1,6 @@
 # Repository guidance
 
-This repository contains Terraform infrastructure and a locally maintained Helm chart for FortiAIGate on AWS EKS. Use the README for deployment, upgrade, and teardown procedures; avoid repeating those procedures here.
+This repository contains Terraform infrastructure and a locally maintained Helm chart for FortiAIGate on AWS EKS. Use the README quickstart and linked deployment/teardown guides for procedures; avoid repeating those procedures here.
 
 ## Working in this repository
 
@@ -13,7 +13,9 @@ This repository contains Terraform infrastructure and a locally maintained Helm 
 
 ## Useful references
 
-- [`README.md`](README.md): prerequisites, deployment, upgrade, verification, and teardown.
+- [`README.md`](README.md): prerequisites, quickstart, verification, and teardown overview.
+- [`docs/deployment-guide.md`](docs/deployment-guide.md): upgrades, configuration, and troubleshooting.
+- [`docs/teardown.md`](docs/teardown.md): staged destruction, backups, and cleanup.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): development setup and local checks.
 - [`docs/technical-notes.md`](docs/technical-notes.md): Terraform and Helm architecture constraints.
 - [`docs/ingress-and-tls.md`](docs/ingress-and-tls.md): ingress exposure and certificate behavior.

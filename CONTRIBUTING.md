@@ -20,7 +20,8 @@ You need:
 
 - Terraform 1.9+
 - AWS CLI v2
-- Helm 3
+- Helm 3 (use the vendored dependencies; do not run `helm dependency update`)
+- Python 3 with PyYAML, and OpenSSL 3 for render and certificate checks
 - [`tflint`](https://github.com/terraform-linters/tflint) — same checks CI runs
 - [`terraform-docs`](https://terraform-docs.io/) — regenerates the [Terraform reference](docs/terraform-reference.md)
 - [`pre-commit`](https://pre-commit.com/) — runs all of the above before each commit
@@ -45,15 +46,20 @@ You can also run the individual checks:
 terraform fmt -recursive -check
 terraform init -backend=false
 terraform validate
+tflint --init
 tflint --recursive
+terraform-docs .
 helm lint fortiaigate
 python3 scripts/test_tls.py
+python3 tests/check_chart.py
 python3 tests/check_gpu_tuning.py
+python3 tests/check_ingress_tls.py
+python3 -m unittest discover -s tests -p test_tls_material.py
 ```
 
 The isolated Terraform tests cover ingress, TLS, and GPU input validation using mocked providers. The GPU render check passes Terraform's composed values through Helm for G5, G6e, CPU-only, and explicit-override cases; it requires Helm and PyYAML and does not access AWS or local Terraform state.
 
-CI runs the same set on every PR (`.github/workflows/terraform.yml`).
+CI runs formatting, validation, lint, and the render/certificate checks on every PR (`.github/workflows/terraform.yml`). `terraform-docs` runs through pre-commit; CI does not currently check generated documentation. Run backend-free initialization in a separate checkout when a deployment is active, so local backend metadata stays intact.
 
 ## Pull requests
 
