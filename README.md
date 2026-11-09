@@ -52,7 +52,7 @@ kubectl get nodes
 kubectl wait --for=condition=Ready nodes --all --timeout=10m
 ```
 
-The initial bootstrap makes EKS available to Terraform's Kubernetes and Helm providers. Stop if it fails or nodes are not Ready. GPU capacity shortages can extend provisioning while AWS retries; see [troubleshooting](docs/deployment-guide.md#troubleshooting).
+The initial bootstrap makes EKS available to Terraform's Kubernetes and Helm providers. Stop if it fails or nodes are not Ready. GPU nodes can use every available regional AZ that offers the selected instance type; this does not guarantee free capacity. Upgrading an existing deployment to this placement creates additional subnets and replaces the GPU node group; review the plan before applying. See [troubleshooting](docs/deployment-guide.md#troubleshooting).
 
 ### 3. Deploy and open FortiAIGate
 

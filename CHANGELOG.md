@@ -18,6 +18,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Changed
 
+- Reserve `10.0.48.0/20` for public subnets when expanding AZ coverage. Assign private subnet index 3 to `10.0.96.0/20`, preserving original subnets and private subnets already created at indexes 4 and 5 during a partial expansion.
+- Create subnets in every available regional Availability Zone and allow GPU nodes in every zone offering the selected instance type. Preserve the original cluster/application subnet selection; expanding GPU placement replaces the GPU node group.
 - Keep the AWS Load Balancer Controller and EFS CSI addon available until application namespace deletion completes. Split namespace/controller teardown stages and document read-only diagnosis of namespace finalizers during an active destroy.
 - Upgrade the locally maintained chart and application image defaults from 8.0.0 to FortiAIGate 8.0.2 build0055. Preserve EKS placement, EFS, TLS, and ingress adaptations. The vendor chart and pinned GPU image versions are unchanged from build0054.
 - Default GPU nodes to `g6e.2xlarge` with the AL2023 NVIDIA AMI. Co-locate Triton and vLLM on one GPU and use `Recreate` rollouts; G5 examples select automatic A10G tuning.

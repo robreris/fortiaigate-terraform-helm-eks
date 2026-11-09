@@ -34,6 +34,7 @@ jobs:
       - name: terraform init (backend=false)
         run: terraform init -backend=false
       - run: terraform validate
+      - run: python3 tests/check_subnet_cidrs.py
       - run: python3 scripts/test_tls.py
       - run: python3 -m unittest discover -s tests -p test_teardown.py
 

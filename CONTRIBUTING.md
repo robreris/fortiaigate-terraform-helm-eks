@@ -46,6 +46,7 @@ You can also run the individual checks:
 terraform fmt -recursive -check
 terraform init -backend=false
 terraform validate
+python3 tests/check_subnet_cidrs.py
 tflint --init
 tflint --recursive
 terraform-docs .

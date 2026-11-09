@@ -7,8 +7,8 @@ Start with the [README quickstart](../README.md#quickstart). This guide covers a
 ```
 AWS
 ├── VPC (10.0.0.0/16)
-│   ├── Private subnets ×3  — EKS nodes, EFS mount targets
-│   └── Public subnets  ×3  — NAT gateway, load balancers
+│   ├── Private subnet/AZ  — EKS nodes, EFS mount targets
+│   └── Public subnet/AZ   — NAT gateway, load balancers
 ├── EKS cluster
 │   ├── App node group      — API, WebUI, LLM gateway, Guardrail, PostgreSQL, Redis, LogD
 │   └── GPU node group      — Triton + vLLM inference (optional, g6e.2xlarge)
@@ -159,6 +159,12 @@ Files merge left-to-right before the built-in `set {}` blocks, so Terraform vari
 **`Unauthorized` on first apply** — Confirm the intended AWS identity, EKS access permissions, and `kubectl get nodes` access. For a new cluster, complete the [initial EKS bootstrap](#two-step-bootstrap-first-deploy) before applying Helm/Kubernetes resources. This is independent of application licensing.
 
 **Node groups stuck in `Creating` for 20+ minutes** — Check the node group health and its Auto Scaling group activity history. Repeated `InsufficientInstanceCapacity` errors indicate AWS cannot currently supply the requested instance type in the selected Availability Zones; the group retries until capacity becomes available. If instances launch but cannot register, inspect NAT gateways and private subnet routes. If the VPC is partial, re-run the VPC bootstrap with the same tfvars before retrying EKS.
+
+The VPC creates public/private subnets in every available standard AZ in `aws_region`. GPU placement checks instance-type offerings across those zones and includes every supported private subnet, excluding zones where the selected instance type is not offered. Offerings are not a live capacity check; Auto Scaling chooses among these subnets when launching. The cluster and application nodes retain the original first three AZs. Additional subnets share the existing single NAT gateway; a full apply also creates their EFS mount targets.
+
+**`InvalidSubnet.Conflict` for `10.0.48.0/20`** — This range contains the existing public subnets. The corrected allocation puts private subnet index 3 in `10.0.96.0/20`, preserving all other subnet CIDRs, including those already created during a partial expansion. Use the corrected code and review a fresh bootstrap plan; do not delete the public subnets or destroy the VPC to retry.
+
+When expanding an existing deployment from three AZs, keep the original subnet indexes and CIDRs. Review a bootstrap plan using the same profile, backend, and tfvars as deployment before applying: expect additional subnets/networking and replacement of the GPU node group, not replacement of the cluster, original subnets, application node group, or EFS filesystem. If interrupting a capacity-stalled apply, press Ctrl-C once and wait for Terraform to exit before planning again. AWS creation can continue after interruption; reconcile any resource missing from state before retrying. Complete the bootstrap and then the full apply as described above.
 
 **ALB has target groups but no listeners** — The `CreateListener` call failed AWS-side validation. The most frequent cause is an ACM certificate ARN in the wrong region; ACM is regional and doesn't replicate. Check `kubectl describe ingress -n fortiaigate fortiaigate-ingress` for the exact error, then issue a cert in the same region as `aws_region` and update `alb.ingress.kubernetes.io/certificate-arn`.
 

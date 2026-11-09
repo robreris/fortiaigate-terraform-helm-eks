@@ -5,8 +5,9 @@ module "eks" {
   cluster_name    = var.cluster_name
   cluster_version = var.cluster_version
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
+  vpc_id = module.vpc.vpc_id
+  # Preserve the existing control-plane and default application node subnets.
+  subnet_ids = slice(module.vpc.private_subnets, 0, min(3, length(local.azs)))
 
   # Public endpoint allows kubectl access from outside the VPC.
   # For production, restrict cluster_endpoint_public_access_cidrs or disable public access.
@@ -55,6 +56,7 @@ module "eks" {
     var.gpu_enabled ? {
       gpu = {
         instance_types = [var.gpu_node_instance_type]
+        subnet_ids     = local.gpu_subnet_ids
         # Use the AL2023 NVIDIA AMI by default so GPU containers with CUDA 13+
         # runtimes have a compatible host driver.
         ami_type     = var.gpu_node_ami_type
