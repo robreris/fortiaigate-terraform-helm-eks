@@ -96,7 +96,15 @@ resource "tls_cert_request" "internal" {
     organization = "FortiAIGate"
   }
 
-  dns_names = tls_cert_request.fortiaigate.dns_names
+  dns_names = distinct(concat(tls_cert_request.fortiaigate.dns_names, flatten([
+    for svc in ["action-guard", "observability", "triton-server", "vllm-server"] : [
+      svc,
+      "${svc}.${var.namespace}",
+      "${svc}.${var.namespace}.svc",
+      "${svc}.${var.namespace}.svc.cluster.local",
+    ]
+  ])))
+  ip_addresses = ["127.0.0.1"]
 }
 
 resource "tls_locally_signed_cert" "internal" {

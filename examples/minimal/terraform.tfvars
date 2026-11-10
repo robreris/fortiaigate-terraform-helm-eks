@@ -6,7 +6,7 @@ aws_region   = "us-east-1"
 cluster_name = "fortiaigate-minimal"
 
 # REQUIRED — your FortiAIGate image registry.
-image_repository = "123456789.dkr.ecr.us-east-1.amazonaws.com/fortiaigate"
+image_repository = "123456789.dkr.ecr.us-east-1.amazonaws.com/fortiaigate-v803"
 
 ingress_class = "nginx"
 ingress_host  = "fortiaigate.example.com"

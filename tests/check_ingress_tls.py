@@ -32,7 +32,7 @@ def pods(docs):
 
 for controller in ("alb", "nginx"):
     docs = render(controller)
-    ingress = next(d for d in docs if d["kind"] == "Ingress")
+    ingress = next(d for d in docs if d["kind"] == "Ingress" and d["metadata"]["name"] == "fortiaigate-ingress")
     if controller == "alb":
         assert "tls" not in ingress["spec"], "ALB must not discover frontend certificates from backend TLS hosts"
         for scheme in ("internal", "internet-facing"):
@@ -47,20 +47,35 @@ for controller in ("alb", "nginx"):
         assert ingress["metadata"]["annotations"]["nginx.ingress.kubernetes.io/backend-protocol"] == "HTTPS"
     workloads = pods(docs)
     rotated = pods(render(controller, web_checksum="web-v2"))
+    services = {d["metadata"]["name"]: d for d in docs if d["kind"] == "Service"}
+    if controller == "alb":
+        for name, protocol in (("auth-oauth", "HTTP"), ("auth-scim", "HTTPS")):
+            annotations = services[name]["metadata"]["annotations"]
+            assert annotations["alb.ingress.kubernetes.io/backend-protocol"] == protocol
+            assert annotations["alb.ingress.kubernetes.io/healthcheck-protocol"] == "HTTP"
+            assert annotations["alb.ingress.kubernetes.io/healthcheck-port"] == "9002"
+            assert annotations["alb.ingress.kubernetes.io/healthcheck-path"] == "/healthz"
+    else:
+        for name in ("fortiaigate-auth-oauth", "fortiaigate-auth-scim"):
+            auth_ingress = next(d for d in docs if d["kind"] == "Ingress" and d["metadata"]["name"] == name)
+            assert auth_ingress["spec"]["tls"][0]["secretName"] == "web-tls"
+    web_workloads = {"api", "llm-gateway", "webui", "mcp-gateway", "plugin-adapter"}
     for name, template in workloads.items():
         pod = template["spec"]
         volumes = {v["name"]: v for v in pod.get("volumes", [])}
-        serving_secret = "web-tls" if name in ("api", "llm-gateway", "webui") else "internal-tls"
-        assert volumes["tls-certs"]["secret"]["secretName"] == serving_secret, name
-        if name in ("api", "llm-gateway", "logd", "license-manager"):
-            assert volumes["internal-tls-certs"]["secret"]["secretName"] == "internal-tls"
+        web_volume = "tls-certs" if name == "webui" else "external-tls-certs"
+        if name in web_workloads:
+            assert volumes[web_volume]["secret"]["secretName"] == "web-tls", name
+        if name in ("api", "llm-gateway", "logd", "license-manager", "auth"):
+            internal_volume = "database-tls" if name == "auth" else "tls-certs"
+            assert volumes[internal_volume]["secret"]["secretName"] == "internal-tls"
             env = {e["name"]: e.get("value") for e in pod["containers"][0]["env"]}
-            for db in (("POSTGRES",) if name == "license-manager" else ("REDIS", "POSTGRES")):
+            for db in ("REDIS", "POSTGRES"):
                 assert env[f"{db}_SSL_CA_CERTS"] == "/etc/internal-tls/ca.crt", name
                 assert env[f"{db}_SSL_CERTFILE"] == "/etc/internal-tls/tls.crt", name
                 assert env[f"{db}_SSL_KEYFILE"] == "/etc/internal-tls/tls.key", name
             mounts = pod["containers"][0]["volumeMounts"]
-            assert any(m["name"] == "internal-tls-certs" and m["mountPath"] == "/etc/internal-tls" for m in mounts)
+            assert any(m["name"] == internal_volume and m["mountPath"] == "/etc/internal-tls" for m in mounts)
         changed = template["metadata"]["annotations"] != rotated[name]["metadata"]["annotations"]
-        assert changed == (name in ("api", "llm-gateway", "webui")), name
+        assert changed == (name in web_workloads), name
     print(f"{controller}: exposure, health checks, TLS mounts and web-only certificate rotation passed")

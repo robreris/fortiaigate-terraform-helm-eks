@@ -41,33 +41,21 @@ If stage 1 fails or nodes are not Ready, fix it before stage 2. If VPC creation 
 
 Subsequent configuration changes normally use a full `terraform plan` and `terraform apply` with the same variable file. Targeting is reserved for this bootstrap and the [staged teardown](teardown.md). A healthy EKS bootstrap does not establish application readiness or validate the full teardown; verify each stage separately.
 
-## Updating from build0054 to build0055
+## Upgrading to 8.0.3 build 6207
 
-Set `image_tag = "V8.0.2-build0055"` in your tfvars, including any existing
-account-specific overrides, and publish the seven application images with that
-tag. The build0055 vendor chart is identical to build0054's, and its Triton,
-vLLM, and model-carrier image versions are unchanged. Keep their exact pinned
-tags listed in [the image inventory](images.md).
+Use `v803` for this upgrade and keep the existing release name, namespace, and state backend. The `main` branch deploys 8.0.2 build 0055.
 
-Back up application data and Secrets before upgrading, then review a full
-`terraform plan` with the same tfvars before applying. This image update does
-not require changing GPU node types, GPU tuning, TLS, licensing, or storage.
+1. Back up PostgreSQL, Redis, EFS, Helm values, and the application Secrets, especially the master key. Rehearse the upgrade against a restored copy before upgrading a production release.
+2. [Stage build 6207 images](images-build6207.md) and update your existing deployment tfvars. Set `image_repository` to your ECR prefix ending in `/fortiaigate-v803` and `image_tag = "V8.0.3-build6207"`. Review Helm overrides in `extra_values_files` against the new chart values. For example, the LLM streaming options now use `windowChars` and `holdbackChars`.
+3. Run a full `terraform plan` with the same tfvars and check that the VPC, EKS, node groups, EFS, and Kubernetes TLS Secret names are retained. Terraform will reissue the internal leaf certificate to add DNS names for the new services and the loopback IP used by the vLLM health checks. Expect application and database pod rollouts.
+4. Apply after reviewing the plan. The Helm pre-upgrade job checks PostgreSQL before Helm changes release workloads. If it fails, check `kubectl -n <namespace> logs job/fortiaigate-schema-preflight`. If it reports a required schema bridge, obtain the supported migration procedure from Fortinet before retrying. Keep the preflight enabled.
+5. Verify WebUI login, API and gateway access, healthy ALB targets, and a policy-enforced LLM request. On GPU deployments, check both inference engines. After the first deployment, back up the Auth identity and internal token Secrets alongside the master key.
 
-## Upgrading from 8.0.0
-
-The bundled chart is FortiAIGate 8.0.2 build0055. Before applying:
-
-1. Back up PostgreSQL, Redis, the shared EFS data, Helm values, and Secrets. Preserve the master-key Secret on subsequent upgrades; encrypted credentials depend on it.
-2. Mirror all ten supplied image archives into your registry using [docs/images.md](images.md). The inference images use fixed tags.
-3. Set `image_tag = "V8.0.2-build0055"` and remove node-keyed `licenses`. Use the default `g6e.2xlarge`, or retain `g5.2xlarge` with [automatic G5 tuning](#gpu-support). Review old extra values files against the new chart; `core` and `scanners` have been replaced by `llmGateway` and `guardrail`.
-4. Review `terraform plan`. Changing the GPU instance type replaces the managed node group; schedule downtime for inference. Apply the upgrade, upload the deployment license, and check all pods become Ready.
-5. Update LLM clients to the `/ai` gateway routes. The console uses `/ui`; the management API remains under `/api/`.
-
-The `Recreate` strategy avoids waiting for a second GPU during rollout. Local validation does not establish compatibility of an existing database with 8.0.2; verify the upgrade against a backup before production use.
+On ALB, Auth and plugin routes share the existing listener and the same ACM and exposure settings. If you enable inference hooks, configure `inferenceHooks.ingress.sourceRanges` to restrict that route by source IP. Use `ingress.annotations` for shared ALB settings. Keep the ALB frontend on HTTPS for browser and identity-provider flows.
 
 ## License management
 
-FortiAIGate 8.0.2 uses deployment licenses stored in PostgreSQL. After deployment, sign in to the WebUI and upload the license. Automation can use the authenticated admin API (`POST /api/v1/admin/licenses`). The license manager runs as a two-replica Deployment.
+FortiAIGate uses deployment licenses stored in PostgreSQL. After deployment, sign in to the WebUI and upload the license. Automation can use the authenticated admin API (`POST /api/v1/admin/licenses`). The license manager runs as a two-replica Deployment.
 
 Remove the old node-keyed `licenses` map from your tfvars. The deprecated variable accepts only an empty map; Terraform no longer creates a license ConfigMap or pins services to licensed nodes. Do not discover node IDs or add license material to Terraform configuration. Uploading or renewing a license does not require Terraform or Helm changes. The initial EKS bootstrap described above is a separate infrastructure dependency.
 

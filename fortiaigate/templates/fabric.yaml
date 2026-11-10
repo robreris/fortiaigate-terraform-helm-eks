@@ -1,0 +1,382 @@
+{{- /*
+The fabric module (fabric/, Go): FortiAIGate's side of the FortiGate <->
+FortiAIGate interface. Optional: fabric.enabled. Interface and design:
+docs/8.0.3/fabric/technical-spec.pdf.
+
+FortiGates reach the POD directly: HTTP/2 + TLS end in the container, because
+that is where a FortiGate's client certificate is verified (against the
+Fortinet CA bundle compiled into the binary) and bound to its serial. So the
+path in is TCP — a NodePort, a LoadBalancer, externalIPs, or a controller's
+TCP passthrough — never an HTTP Ingress, which would terminate the TLS and
+drop the certificate.
+
+What the pod needs, each for one reason:
+  PostgreSQL          the device registry and the compiled config snapshot
+                      (guardrail catalogue); NOTIFY fabric_device_changed keeps
+                      every replica's registry current
+  guardrail:50051     one Scan per message; TLS exactly when the pool serves it
+                      (tls.enabled), verification skipped like llm-gateway's
+  license-manager     "may it serve / may it scan", and the licence whose
+                      Fortinet certificate the listener presents. The poller
+                      authenticates as the "fabric" service identity, a token
+                      derived from the service-account namespace + CA files,
+                      so automountServiceAccountToken must stay on (it is the
+                      default)
+  a TLS pair          shown until a licence is installed, never after (the
+                      licence's certificate is the only one FortiGates can
+                      verify): the chart's internal pair in Secret
+                      fortiaigate-tls-secret
+  Redis               the Fabric Traffic Log: one record per scanned message
+                      onto faig:logs:fabric, which LogD stores
+                      (docs/8.0.3/fabric/src/llm-spec.md §9). NOT a
+                      readiness input: scans are served without it, only the
+                      log records are lost, counted in the module log. Same
+                      settings and TLS files as logd's.
+*/ -}}
+{{- if (.Values.fabric).enabled }}
+{{- $f := .Values.fabric }}
+{{- $svc := $f.service | default dict }}
+{{- $type := $svc.type | default "NodePort" }}
+{{- if not (has $type (list "ClusterIP" "NodePort" "LoadBalancer")) }}
+{{- fail (printf "fabric.service.type must be ClusterIP, NodePort or LoadBalancer, got %q" $type) }}
+{{- end }}
+{{- $port := int ($svc.port | default 8443) }}
+{{- /* Retired values are refused, never ignored, so a stale values file cannot
+       change what a deployment does without a word:
+       - fabric.tls.source (2026-10-10): FortiGates are always shown the
+         licence's certificate. Its old default is tolerated; "file" asked for
+         a mode that no longer exists.
+       - fabric.tls.existingSecret (2026-10-30): until a licence is installed
+         they are shown the chart's internal pair, never a pair of the
+         deployment's choosing.
+       - fabric.image.tag (2026-10-30): fabric runs the deployment's image
+         tag, like every other module.
+       - fabric.matchVerdict (2026-10-30): the chart no longer sets
+         FABRIC_MATCH_VERDICT; /scan answers Allow or Block, /scan2 the
+         guardrail's own action. Its old default, deny, is tolerated: it is
+         in every values file copied from the chart before this date. */}}
+{{- with ($f.tls).source }}
+{{- if ne (lower .) "license" }}
+{{- fail (printf "fabric.tls.source is retired: FortiGates are always shown the Fortinet-issued certificate in the deployment's licence (the chart's internal pair until one is installed); remove it (got %q)" .) }}
+{{- end }}
+{{- end }}
+{{- with ($f.tls).existingSecret }}
+{{- fail (printf "fabric.tls.existingSecret is retired: until a licence is installed FortiGates are shown the chart's internal pair (Secret fortiaigate-tls-secret), then the licence's certificate; remove it (got %q)" .) }}
+{{- end }}
+{{- with ($f.image).tag }}
+{{- fail (printf "fabric.image.tag is retired: fabric runs the deployment's image tag, fortiaigate.image.tag, like every other module; remove it (got %q)" .) }}
+{{- end }}
+{{- with $f.matchVerdict }}
+{{- if ne (lower .) "deny" }}
+{{- fail (printf "fabric.matchVerdict is retired: /scan answers Allow or Block and /scan2 the guardrail's own action; remove it (got %q)" .) }}
+{{- end }}
+{{- end }}
+{{- /* The listener always needs a pair (fabric/internal/config: required; it
+       is what FortiGates are shown until a licence is installed).
+       fortiaigate-tls-secret exists while any platform TLS switch is on — the
+       default — so this only stops a render with every one of them off. */}}
+{{- if not (or .Values.tls.enabled .Values.postgresql.tls.enabled .Values.redis.tls.enabled) }}
+{{- fail "fabric needs a TLS certificate pair for its listener until a licence is installed: keep tls.enabled on (it renders Secret fortiaigate-tls-secret)" }}
+{{- end }}
+{{- /* `default` cannot carry a boolean whose default is true: Helm treats
+       false as empty, so `false | default true` yields true and the switch
+       could never be turned off. `dig` keeps an explicit false. */}}
+{{- $bindSerial := dig "bindSerial" true $f }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fabric
+  labels:
+    app: fabric
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+spec:
+  # Tested with one. More work by design: each replica keeps its own copy of
+  # the device registry, kept current by NOTIFY, and counters are flushed as
+  # deltas.
+  replicas: {{ hasKey $f "replicas" | ternary (int $f.replicas) 1 }}
+  strategy:
+    type: {{ .Values.fortiaigate.updateStrategy }}
+  selector:
+    matchLabels:
+      app: fabric
+  template:
+    metadata:
+      {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+      annotations:
+        # Restart the pod when the chart-generated internal certificate
+        # changes: its PostgreSQL, Redis, guardrail and licence clients read
+        # it, as their CA, once at start
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+      {{- end }}
+      labels:
+        app: fabric
+        app.kubernetes.io/name: fortiaigate
+        app.kubernetes.io/part-of: fortiaigate-platform
+        app.kubernetes.io/managed-by: helm
+    spec:
+      # No checksum/config restart annotation: the module re-reads a changed
+      # serving pair by itself, and the licence certificate is swapped in
+      # place as soon as a licence is installed.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: fabric
+        image: {{ .Values.fortiaigate.image.repository }}/fabric:{{ .Values.fortiaigate.image.tag }}
+        imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - containerPort: 8443
+          name: https
+          protocol: TCP
+        # Both probes are plain HTTPS without a client certificate: the
+        # listener requests one but does not require it. Readiness is 200 once
+        # the organization, its config snapshot and the device registry are
+        # loaded — so the pod stays NotReady until the WebUI first-run setup
+        # has created the organization.
+        readinessProbe:
+          httpGet:
+            path: /fabric/health/readiness
+            port: https
+            scheme: HTTPS
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /fabric/health/liveness
+            port: https
+            scheme: HTTPS
+          initialDelaySeconds: 10
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 3
+        resources:
+          {{- toYaml $f.resources | nindent 10 }}
+        env:
+        - name: FORTIAIGATE_LOG_LEVEL
+          value: {{ .Values.fortiaigate.env.logLevel | quote }}
+        - name: FABRIC_LISTEN_ADDR
+          value: ":8443"
+        # The pair shown until a licence is installed; FortiGates are then
+        # shown the Fortinet-issued certificate the licence carries.
+        - name: FABRIC_TLS_CERT_FILE
+          value: /etc/fabric/tls/tls.crt
+        - name: FABRIC_TLS_KEY_FILE
+          value: /etc/fabric/tls/tls.key
+        - name: FABRIC_MTLS_BIND_SERIAL
+          value: {{ $bindSerial | quote }}
+        {{- with $f.orgId }}
+        - name: FABRIC_ORG_ID
+          value: {{ . | quote }}
+        {{- end }}
+        - name: FABRIC_LICENSE_URL
+          value: "https://license-manager:9443/api/v1/license/status"
+        - name: FAIG_GUARDRAIL_ADDR
+          value: "guardrail:50051"
+        # The dispatcher serves TLS exactly when the platform cert is mounted
+        # (tls.enabled): the internal certificate, verified here as
+        # llm-gateway and license-manager verify it. The server name is the
+        # host of the address, which its SANs carry.
+        - name: FAIG_GUARDRAIL_TLS
+          value: {{ .Values.tls.enabled | ternary "verify" "off" | quote }}
+        {{- if .Values.tls.enabled }}
+        - name: FAIG_GUARDRAIL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        # The CA the licence poll (FABRIC_LICENSE_URL) verifies the licence
+        # manager against
+        - name: FAIG_INTERNAL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- end }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        # Mutual TLS (tls.mutual): the client certificate, the internal pair,
+        # that the guardrail pool and the licence manager require
+        - name: FAIG_GUARDRAIL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_GUARDRAIL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
+        # The guardrail's scan cap, in tokens: /scan2 tells a FortiGate the
+        # longest text it takes in characters, 4 a token (max_scan_len).
+        - name: SCANNER_MAX_SCAN_TOKENS
+          value: {{ .Values.guardrail.env.maxScanTokens | quote }}
+        {{- if (($f.resources).limits).memory }}
+        # GOMEMLIMIT follows this container's limit (9/10 of it), as
+        # llm-gateway's does. Guarded on the limit existing: without one,
+        # resourceFieldRef falls back to the NODE's allocatable memory.
+        - name: FAIG_MEMORY_LIMIT_BYTES
+          valueFrom:
+            resourceFieldRef:
+              containerName: fabric
+              resource: limits.memory
+              divisor: "1"
+        {{- end }}
+        {{- with $f.goMemLimit }}
+        # An explicit Go heap ceiling (fabric.goMemLimit), used as it is.
+        - name: GOMEMLIMIT
+          value: {{ . | quote }}
+        {{- end }}
+        - name: POSTGRES_USER
+          value: "{{ .Values.postgresql.auth.username }}"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-postgresql
+              key: password
+        - name: POSTGRES_DB
+          value: "{{ .Values.postgresql.auth.database }}"
+        - name: POSTGRES_HOST
+          value: "{{ .Release.Name }}-postgresql"
+        - name: POSTGRES_PORT
+          value: "{{ .Values.postgresql.primary.service.port }}"
+        {{- if .Values.postgresql.tls.enabled }}
+        - name: POSTGRES_SSL_ENABLED
+          value: "true"
+        - name: POSTGRES_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: POSTGRES_SSL_VERIFY
+          value: "true"
+        # The client certificate PostgreSQL requires with
+        # postgresql.tls.certCAFilename: the internal pair
+        - name: POSTGRES_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
+        # The Fabric Traffic Log's transport, configured as logd's is.
+        - name: REDIS_SSL_ENABLED
+          value: {{ .Values.redis.tls.enabled | quote }}
+        {{- if .Values.redis.tls.enabled }}
+        - name: REDIS_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: REDIS_SSL_VERIFY
+          value: "true"
+        {{- end }}
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_HOST
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_PORT
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-redis
+              key: redis-password
+        {{- with ($f.inStream).windowChars }}
+        # The /scan2 stream scan window, in characters: the gateway's pair
+        # (llmGateway.env.inStream) for FortiGate streams. Rendered only when
+        # set, so the module's defaults (1024 / 256) stay the single source of
+        # truth.
+        - name: FABRIC_INSTREAM_WINDOW_CHARS
+          value: {{ . | quote }}
+        {{- end }}
+        {{- with ($f.inStream).holdbackChars }}
+        - name: FABRIC_INSTREAM_HOLDBACK_CHARS
+          value: {{ . | quote }}
+        {{- end }}
+        {{- range $k, $v := $f.env }}
+        - name: {{ $k }}
+          value: {{ $v | quote }}
+        {{- end }}
+        volumeMounts:
+        - name: fabric-tls
+          mountPath: /etc/fabric/tls
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        # The internal certificate, as logd mounts it: the CA of the
+        # PostgreSQL, Redis, guardrail and licence clients, and the pair the
+        # Redis client presents.
+        - name: tls-certs
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
+          readOnly: true
+        {{- end }}
+      volumes:
+      - name: fabric-tls
+        secret:
+          secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
+      - name: tmp
+        emptyDir: {}
+      {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+      - name: tls-certs
+        secret:
+          secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
+      {{- end }}
+      {{- with .Values.fortiaigate.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+# The FortiGates' way in: TCP to the pod's 8443 (see the header).
+apiVersion: v1
+kind: Service
+metadata:
+  name: fabric
+  labels:
+    app: fabric
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+  {{- with $svc.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $type }}
+  selector:
+    app: fabric
+  ports:
+  - name: https
+    protocol: TCP
+    port: {{ $port }}
+    targetPort: https
+    {{- if and (ne $type "ClusterIP") $svc.nodePort }}
+    nodePort: {{ int $svc.nodePort }}
+    {{- end }}
+  {{- with $svc.externalIPs }}
+  # Node (or other node-routed) addresses that answer on the port above
+  # themselves — <node IP>:8443 instead of a 30000+ NodePort. kube-proxy on
+  # every node forwards to the pod wherever it runs. The port must be free on
+  # each address: nothing here can detect a collision.
+  externalIPs:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if eq $type "LoadBalancer" }}
+  {{- with $svc.loadBalancerIP }}
+  loadBalancerIP: {{ . | quote }}
+  {{- end }}
+  {{- with $svc.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  {{- if and (ne $type "ClusterIP") $svc.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ $svc.externalTrafficPolicy }}
+  {{- end }}
+{{- end }}

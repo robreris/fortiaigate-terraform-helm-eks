@@ -5,8 +5,8 @@ import subprocess
 import yaml
 
 CHART = Path(__file__).resolve().parents[1] / "fortiaigate"
-REPO = "example.com/fortiaigate"
-INVENTORY = json.loads((CHART.parent / "docs/build0055-images.json").read_text())
+REPO = "example.com/fortiaigate-v803"
+INVENTORY = json.loads((CHART.parent / "docs/build6207-images.json").read_text())
 TAGS = {image["image"]: image["tag"] for image in INVENTORY["images"]}
 
 for mode in ("cpu", "shared", "dedicated"):
@@ -23,9 +23,20 @@ for mode in ("cpu", "shared", "dedicated"):
         "ingress.className": "alb",
         "tls.existingSecret": "external-tls",
         "tls.existingSecretChecksum": "rotation-checksum",
-        "postgresql.tls.certificatesSecret": "external-tls",
-        "redis.tls.existingSecret": "external-tls",
+        "tls.internalExistingSecret": "internal-tls",
+        "tls.internalExistingSecretChecksum": "internal-rotation-checksum",
+        "postgresql.tls.certificatesSecret": "internal-tls",
+        "redis.tls.existingSecret": "internal-tls",
+        "storage.storageClass": "efs-sc",
     }
+    if mode == "shared":
+        settings.update({
+            "fabric.enabled": "true",
+            "inferenceHooks.enabled": "true",
+            "inferenceHooks.card.signingSecret": "whsec_render-test",
+        })
+        args += ["--set-string", "inferenceHooks.card.endpointId=abcdef0123456789abcdef0123456789",
+                 "--set", "inferenceHooks.ingress.sourceRanges[0]=192.0.2.0/24"]
     for key, value in settings.items():
         args += ["--set", f"{key}={value}"]
     args += ["--set-string", "fortiaigate.gpuWorkloadPlacement.tolerations[0].value=true",
@@ -41,14 +52,17 @@ for mode in ("cpu", "shared", "dedicated"):
         assert "requiredDuringSchedulingIgnoredDuringExecution" not in affinity, name
         for volume in pod.get("volumes", []):
             if volume["name"] == "tls-certs":
-                assert volume["secret"]["secretName"] == "external-tls", name
+                expected_secret = "external-tls" if name == "webui" else "internal-tls"
+                assert volume["secret"]["secretName"] == expected_secret, name
         for c in pod.get("containers", []) + pod.get("initContainers", []):
             if c["image"].startswith(REPO):
                 images.add(c["image"])
-                if name not in {"triton-server", "triton-vllm-server", "vllm-server"}:
-                    assert workload["spec"]["template"]["metadata"]["annotations"]["checksum/tls"] == "rotation-checksum", name
-    expected = {f"{REPO}/{name}:{tag}" for name, tag in TAGS.items()
-                if mode != "cpu" or name not in ("custom-triton", "vllm-server", "faig-models")}
+    excluded = set()
+    if mode == "cpu":
+        excluded.update(("custom-triton", "vllm-server", "faig-models"))
+    if mode != "shared":
+        excluded.update(("fabric", "inference-hooks"))
+    expected = {f"{REPO}/{name}:{tag}" for name, tag in TAGS.items() if name not in excluded}
     assert images == expected, (mode, images ^ expected)
     gpu_names = {"triton-vllm-server"} if mode == "shared" else {"triton-server", "vllm-server"} if mode == "dedicated" else set()
     assert {n for n in workloads if n.startswith(("triton", "vllm"))} == gpu_names
@@ -66,6 +80,48 @@ for mode in ("cpu", "shared", "dedicated"):
     assert annotations["alb.ingress.kubernetes.io/target-type"] == "ip"
     assert annotations["alb.ingress.kubernetes.io/backend-protocol"] == "HTTPS"
     routes = {p["path"]: p["backend"]["service"]["name"] for p in ingress["spec"]["rules"][0]["http"]["paths"]}
-    assert routes == {"/api/": "api", "/ui": "webui", "/ai": "llm-gateway", "/": "webui"}
-    assert not any(d["kind"] == "Secret" and d["metadata"]["name"] == "external-tls" for d in docs)
-    print(f"{mode}: images, GPU placement/allocation, TLS, licensing, and ingress passed")
+    expected_routes = {
+        "/api/v1/plugins/claude-code": "plugin-adapter-mcp",
+        "/oauth": "auth-oauth",
+        "/.well-known/oauth-authorization-server/oauth": "auth-oauth",
+        "/.well-known/openid-configuration/oauth": "auth-oauth",
+        "/api/auth/sso/oidc/callback": "auth-oauth",
+        "/scim/v2": "auth-scim",
+        "/api/v1/scim": "auth-scim",
+        "/api/": "api",
+        "/ui": "webui",
+        "/ai": "llm-gateway",
+        "/plugin": "plugin-adapter",
+        "/mcp/gateways": "mcp-gateway",
+        "/.well-known/oauth-protected-resource/mcp/gateways": "mcp-gateway",
+        "/": "webui",
+    }
+    if mode == "shared":
+        expected_routes["/inference-hooks"] = "inference-hooks"
+        conditions = json.loads(annotations["alb.ingress.kubernetes.io/conditions.inference-hooks"])
+        assert conditions == [{"field": "source-ip", "sourceIpConfig": {"values": ["192.0.2.0/24"]}}]
+    assert routes == expected_routes, (mode, routes)
+    assert list(routes).index("/api/auth/sso/oidc/callback") < list(routes).index("/api/")
+    assert sum(d["kind"] == "Ingress" for d in docs) == 1
+    assert not any(d["kind"] == "Secret" and d["metadata"]["name"] in {"external-tls", "internal-tls"} for d in docs)
+    assert any(d["kind"] == "Job" and d["metadata"]["name"].startswith("fortiaigate-auth-identity-") for d in docs)
+    assert not any(d["kind"] == "Job" and d["metadata"]["name"] == "fortiaigate-schema-preflight" for d in docs)
+    for name in ("fortiaigate-postgresql", "fortiaigate-redis-master"):
+        volumes = workloads[name]["spec"]["template"]["spec"]["volumes"]
+        assert any(v.get("persistentVolumeClaim", {}).get("claimName") == "fortiaigate-storage" for v in volumes)
+    claim = next(d for d in docs if d["kind"] == "PersistentVolumeClaim" and d["metadata"]["name"] == "fortiaigate-storage")
+    assert claim["spec"]["storageClassName"] == "efs-sc"
+
+    # Offline upgrade renders need dummy passwords because Helm lookup has no cluster.
+    args += ["--is-upgrade", "--set",
+             "global.redis.password=render-only,postgresql.auth.password=render-only,postgresql.auth.postgresPassword=render-only"]
+    upgrade = list(filter(None, yaml.safe_load_all(subprocess.check_output(args, text=True))))
+    job = next(d for d in upgrade if d["kind"] == "Job" and d["metadata"]["name"] == "fortiaigate-schema-preflight")
+    assert job["metadata"]["annotations"]["helm.sh/hook"] == "pre-upgrade"
+    pod = job["spec"]["template"]["spec"]
+    preflight = pod["containers"][0]
+    assert preflight["image"] == f"{REPO}/api:{INVENTORY['release']}"
+    assert {"name": "POSTGRES_SSL_CA_CERTS", "value": "/etc/internal-tls/ca.crt"} in preflight["env"]
+    assert {"name": "postgres-tls", "mountPath": "/etc/internal-tls", "readOnly": True} in preflight["volumeMounts"]
+    assert pod["volumes"][0]["secret"]["secretName"] == "internal-tls"
+    print(f"{mode}: image, storage, GPU, ALB, Auth and schema preflight renders passed")

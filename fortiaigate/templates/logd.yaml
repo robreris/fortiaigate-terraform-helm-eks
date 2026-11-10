@@ -10,8 +10,6 @@ metadata:
     app.kubernetes.io/managed-by: helm
     component: logd
     version: v1
-  annotations:
-    deployment.kubernetes.io/revision: "1"
 spec:
   replicas: {{ .Values.logd.replicas }}
   strategy:
@@ -23,10 +21,10 @@ spec:
   template:
     metadata:
       annotations:
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        # Restart the pod when the chart-generated internal certificate changes
         checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
-        checksum/tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
-        # This is the key that triggers a restart when TLS certificates change
-        checksum/config: {{ printf "%s%s" (tpl (.Files.Get .Values.tls.cert) $) (tpl (.Files.Get .Values.tls.key) $) | sha256sum }}
+        {{- end }}
       labels:
         app: logd
         component: logd
@@ -63,29 +61,44 @@ spec:
           value: {{ .Values.fortiaigate.env.logLevel | quote }}
         {{- if .Values.tls.enabled }}
         - name: FORTIAIGATE_SSL_CERT_FILE
-          value: {{ printf "%s/tls.crt" .Values.tls.mountPath | quote }}
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: FORTIAIGATE_SSL_KEY_FILE
-          value: {{ printf "%s/tls.key" .Values.tls.mountPath | quote }}
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        # The CA this pod verifies the licence manager against
+        - name: FAIG_INTERNAL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        # Mutual TLS (tls.mutual): the client certificate this pod presents to
+        # the servers that require one, the internal pair itself
+        - name: FAIG_INTERNAL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
         {{- end }}
         - name: REDIS_SSL_ENABLED
           value: {{ .Values.redis.tls.enabled | quote }}
         {{- if .Values.redis.tls.enabled }}
         - name: REDIS_SSL_CERTFILE
-          value: {{ printf "%s/tls.crt" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: REDIS_SSL_KEYFILE
-          value: {{ printf "%s/tls.key" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: REDIS_SSL_CA_CERTS
-          value: {{ printf "%s/%s" (include "fortiaigate.dbTlsMountPath" .) (include "fortiaigate.dbTlsCAFile" .) | quote }}
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: REDIS_SSL_VERIFY
+          value: "true"
         {{- end }}
         - name: POSTGRES_SSL_ENABLED
           value: {{ .Values.postgresql.tls.enabled | quote }}
         {{- if .Values.postgresql.tls.enabled }}
         - name: POSTGRES_SSL_CERTFILE
-          value: {{ printf "%s/tls.crt" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: POSTGRES_SSL_KEYFILE
-          value: {{ printf "%s/tls.key" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: POSTGRES_SSL_CA_CERTS
-          value: {{ printf "%s/%s" (include "fortiaigate.dbTlsMountPath" .) (include "fortiaigate.dbTlsCAFile" .) | quote }}
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: POSTGRES_SSL_VERIFY
+          value: "true"
         {{- end }}
         # Database configuration (only what's actually used by the application)
         - name: REDIS_HOST
@@ -134,10 +147,9 @@ spec:
           mountPath: /tmp
         {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
         - name: tls-certs
-          mountPath: {{ .Values.tls.mountPath | quote }}
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
           readOnly: true
         {{- end }}
-      {{- include "fortiaigate.dbTlsVolumeMount" . | nindent 8 }}
       volumes:
       - name: shared-data
         persistentVolumeClaim:
@@ -149,7 +161,6 @@ spec:
         secret:
           secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
       {{- end }}
-      {{- include "fortiaigate.dbTlsVolume" . | nindent 6 }}
       {{- with .Values.fortiaigate.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

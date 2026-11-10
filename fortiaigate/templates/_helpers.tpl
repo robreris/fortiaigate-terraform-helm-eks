@@ -85,21 +85,149 @@ a second copy is how two services end up on different keys.
 {{- end }}
 
 {{/*
-Renders a JSON map of legacy scanner-name -> maxScanChars for llm-gateway's
-scanner-cache key (SCANNER_MAX_SCAN_CHARS_BY_NAME). The named aiguard scanners
-are retired; the names remain only for llm-gateway cache-key compatibility and
-all resolve to the single guardrail.env.maxScanChars, so changing it invalidates
-stale cache entries. (This map can later drop to {} once llm-gateway drops the
-per-name cache dimension.)
+The internal TLS certificate (templates/tls-secrets.yaml) in this render, as
+JSON: "renew" (the chart generates it now), "revision" (the release revision
+that generated it), "notAfter" (when it expires, RFC 3339 UTC), "days" (the
+validity it is generated with) and "names" (its DNS names,
+fortiaigate.internalTlsNames). Decided by fortiaigate.internalTlsDecide from
+the Secret as it is in the cluster.
+
+It reads only .Release, so the PostgreSQL and Redis sub-charts can call it too
+(through fortiaigate.internalTlsRevision, in their podAnnotations in
+values.yaml). That is also why the validity and the renewal margin are
+constants in fortiaigate.internalTlsDecide and not values: in a sub-chart,
+.Values is the sub-chart's own. For the same reason it cannot renew on a chart
+version change: in a sub-chart, .Chart is the sub-chart's too.
 */}}
-{{- define "fortiaigate.scannerMaxCharsByName" -}}
-{{- $globalMax := .Values.guardrail.env.maxScanChars -}}
-{{- $result := dict -}}
-{{- range $scanner := list "language" "code" "promptinjection" "sensitive" "toxicity" "anonymize" "deanonymize" "customrule" -}}
-  {{- $_ := set $result $scanner ($globalMax | toString) -}}
-{{- end -}}
-{{- $result | toJson -}}
+{{- define "fortiaigate.internalTls" -}}
+{{- include "fortiaigate.internalTlsDecide" (dict "secret" (lookup "v1" "Secret" .Release.Namespace "fortiaigate-tls-secret") "revision" .Release.Revision "names" (include "fortiaigate.internalTlsNames" .)) -}}
 {{- end }}
+
+{{/*
+Whether the deployment's own pods talk mutual TLS, "true" or empty:
+tls.mutual, which needs tls.enabled. The guardrail pool (guardrail,
+dlp-scanner, policy-guard), the licence manager, Triton's gRPC port and vLLM
+then require the client's certificate (FAIG_INTERNAL_TLS_CLIENT_AUTH, Triton's
+--grpc-use-ssl-mutual, vLLM's --ssl-cert-reqs), and every pod that dials one
+presents the internal pair, whose key usage allows client authentication
+(FAIG_INTERNAL_TLS_CERT_FILE/KEY_FILE, FAIG_GUARDRAIL_TLS_CERT_FILE/KEY_FILE).
+PostgreSQL and Redis have their own switches, postgresql.tls.certCAFilename
+and redis.tls.authClients, and their clients always present the pair.
+*/}}
+{{- define "fortiaigate.internalMtls" -}}
+{{- if and .Values.tls.enabled .Values.tls.mutual -}}true{{- end -}}
+{{- end }}
+
+{{/*
+The DNS names the internal certificate carries (beside IP 127.0.0.1), comma
+separated: every Service a pod dials over TLS with it and checks by name, and
+localhost. A listener the ingress routes to (inference-hooks, mcp-gateway's
+:8443, plugin-adapter's) serves the external certificate instead, so it is not
+named here. A name added here regenerates the certificate on the next upgrade
+(fortiaigate.internalTlsDecide), because a client that checks a name the
+certificate lacks refuses every connection.
+
+The list must not depend on any value of this chart: the PostgreSQL and Redis
+sub-charts make the same decision in their own context (their podAnnotations,
+checksum/internal-tls), where .Values is theirs. A name that depended on, say,
+an enabled switch would make them keep the certificate this chart renews: they
+would not restart, and would serve the old certificate to clients that trust
+only the new one.
+*/}}
+{{- define "fortiaigate.internalTlsNames" -}}
+{{- join "," (list "localhost" "guardrail" "dlp-scanner" "policy-guard" "license-manager" "triton-server" "vllm-server" "action-guard" "observability" (printf "%s-postgresql" .Release.Name) (printf "%s-redis-master" .Release.Name)) -}}
+{{- end }}
+
+{{/*
+The URL its callers (plugin-adapter, inference-hooks, mcp-gateway) take for a
+companion service in the deployment, from "root", "name" and "port": with
+tls.enabled https, where the service serves the internal certificate, which
+names it, and under tls.mutual serves only the pods that present the internal
+pair; http otherwise.
+*/}}
+{{- define "fortiaigate.companionURL" -}}
+{{- ternary "https" "http" .root.Values.tls.enabled }}://{{ .name }}:{{ .port }}
+{{- end }}
+
+{{/*
+REDIS_URL of action-guard and observability, in the redis-py form they read:
+database "db" of the shared Redis, from "root" and "db". With
+redis.tls.enabled, Redis is verified against the internal certificate, which
+names <release>-redis-master, and the internal pair is the client
+certificate, which redis.tls.authClients requires. The kubelet expands
+$(REDIS_PASSWORD) from the variable declared before it.
+*/}}
+{{- define "fortiaigate.companionRedisURL" -}}
+{{- $root := .root -}}
+{{- $at := printf "%s-redis-master:%v/%v" $root.Release.Name $root.Values.redis.master.service.port .db -}}
+{{- if $root.Values.redis.tls.enabled -}}
+{{- $m := include "fortiaigate.internalTlsMountPath" $root -}}
+rediss://:$(REDIS_PASSWORD)@{{ $at }}?ssl_cert_reqs=required&ssl_ca_certs={{ include "fortiaigate.internalTlsCAFile" $root }}&ssl_certfile={{ $m }}/tls.crt&ssl_keyfile={{ $m }}/tls.key
+{{- else -}}
+redis://:$(REDIS_PASSWORD)@{{ $at }}
+{{- end -}}
+{{- end }}
+
+{{/*
+fortiaigate.internalTls's decision, from "secret" (the Secret, or an empty map
+when there is none), "revision" (.Release.Revision) and "names"
+(fortiaigate.internalTlsNames). The chart generates the certificate, valid 10
+years:
+  - when there is no Secret, or it has no internal-tls-revision annotation: the
+    first install, or the first upgrade from 8.0.2, which kept the external
+    certificate under this name;
+  - when its internal-tls-names annotation is not "names": a name was added.
+    The first 8.0.3 charts wrote no such annotation, and their certificate
+    lacks triton-server and vllm-server, so it is regenerated once;
+  - when it expires in fewer than 5 years. Customers upgrade more often than
+    that, so the certificate is renewed before it expires and nobody has to
+    delete the Secret by hand.
+A not-after annotation that does not parse reads as already expired: renewed.
+Every pod that uses the certificate restarts when it is renewed, PostgreSQL,
+Redis, Triton and vLLM included (fortiaigate.internalTlsRevision). That
+interrupts traffic for about a minute (75 s of failed LLM requests measured on
+a lab box, 2026-10-25, before the engines served TLS): old and new pods cannot
+verify each other until all have restarted, and llm-gateway reads PostgreSQL
+on every request. The engines take longer, minutes of model load, and DLP and
+POLICY detectors fail closed until they are back. Accepted, once in 5+ years;
+the measurement and what a fix would take are docs/known-issues.md #102.
+*/}}
+{{- define "fortiaigate.internalTlsDecide" -}}
+{{- $days := 3650 -}}
+{{- $renewWithin := "+43800h" -}}
+{{- $layout := "2006-01-02T15:04:05Z07:00" -}}
+{{- $ann := dig "metadata" "annotations" dict .secret -}}
+{{- $revision := get $ann "fortiaigate.io/internal-tls-revision" -}}
+{{- $notAfter := get $ann "fortiaigate.io/internal-tls-not-after" -}}
+{{- /* A Secret from 3a88459d8, which wrote no expiry, has no names either:
+  the names rule renews it, so its missing expiry needs no default. */ -}}
+{{- $renew := or (not $revision) (ne (get $ann "fortiaigate.io/internal-tls-names") .names) (lt (int64 (unixEpoch (toDate $layout $notAfter))) (int64 (unixEpoch (now | dateModify $renewWithin)))) -}}
+{{- if $renew -}}
+{{- $revision = toString .revision -}}
+{{- $notAfter = dateInZone $layout (now | dateModify (printf "+%dh" (mul 24 $days))) "UTC" -}}
+{{- end -}}
+{{- toJson (dict "renew" $renew "revision" $revision "notAfter" $notAfter "days" $days "names" .names) -}}
+{{- end }}
+
+{{/*
+The release revision that generated the internal TLS certificate. Each pod
+that uses the certificate carries its sha256sum as checksum/internal-tls, so
+the pod restarts when the certificate is generated or renewed, and at no other
+time.
+*/}}
+{{- define "fortiaigate.internalTlsRevision" -}}
+{{- (include "fortiaigate.internalTls" . | fromJson).revision -}}
+{{- end }}
+
+{{/*
+The Secret (key "internal-token") holding FAIG_INTERNAL_TOKEN, the service
+secret mcp-gateway, plugin-adapter and the companions (FAIG_MCP_ADMISSION_KEY)
+read: an operator's, or the one internal-token-secret.yaml generates.
+*/}}
+{{- define "fortiaigate.internalTokenSecretName" -}}
+{{- .Values.fortiaigate.internalTokenExistingSecret | default (printf "%s-internal-token" (include "fortiaigate.fullname" .)) -}}
+{{- end }}
+
 {{/*
 The model name clients call on the vLLM policyGuard server, independent of the
 weights directory the pod serves from.
@@ -415,7 +543,7 @@ NOTES.txt and in k8s/tests/test_gpu_profiles_render.py — CLAUDE.md's
 "New GPU-sized knob" bullet.
 */}}
 {{- define "fortiaigate.gpuProfileKeys" -}}
-{{- dict "triton" (dict "dlpInstancesPerGpu" false "dlpMaxBatchSize" false "cpuLimit" false) "vllm" (dict "maxNumSeqs" false "apiServerCount" false "blockSize" true "gpuMemoryUtilization" true "cpuLimit" false "cpuRequest" false) "guardrail" (dict "dlpQueueChars" false "policyQueueChars" false) | toJson -}}
+{{- dict "triton" (dict "dlpInstancesPerGpu" false "dlpMaxBatchSize" false "cpuLimit" false) "vllm" (dict "maxModelLen" false "maxNumSeqs" false "apiServerCount" false "blockSize" true "gpuMemoryUtilization" true "cpuLimit" false "cpuRequest" false) "guardrail" (dict "dlpQueueChars" false "policyQueueChars" false) | toJson -}}
 {{- end }}
 
 {{/*
@@ -627,36 +755,85 @@ it did. NOTES.txt says which flags extraArgs overrode. Args: root, flag.
 {{- if $hit -}}true{{- end -}}
 {{- end }}
 
+{{/* Shared storage must resolve identically inside the PostgreSQL/Redis
+subchart contexts. Their .Chart.Name is not the parent chart's name. For a
+custom parent fullnameOverride, set global.fortiaigateStorageClaim too. */}}
+{{- define "fortiaigate.storageClaim" -}}
+{{- if .Values.global.fortiaigateStorageClaim -}}
+{{- .Values.global.fortiaigateStorageClaim -}}
+{{- else if contains "fortiaigate" .Release.Name -}}
+{{- printf "%s-storage" (.Release.Name | trunc 63 | trimSuffix "-") -}}
+{{- else -}}
+{{- printf "%s-storage" (printf "%s-fortiaigate" .Release.Name | trunc 63 | trimSuffix "-") -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
-Return the TLS secret name used by FortiAIGate workloads.
+The ingress controller the chart writes annotations for: ingress.controllerType
+when set (a custom class name), else ingress.className. ingress.yaml,
+auth-ingress.yaml and the backend Services all ask this one helper.
 */}}
+{{- define "fortiaigate.ingressController" -}}
+{{- default .Values.ingress.className .Values.ingress.controllerType -}}
+{{- end }}
+
+{{/*
+Traefik dials an Ingress backend over HTTPS only when the backend's SERVICE
+says so; no Ingress annotation can, so ingress.annotations cannot either.
+With tls.enabled every backend the platform Ingress routes listens with TLS,
+and each of those Services includes this: the scheme, and the
+ServersTransport the dial uses (ingress.traefik.serversTransport, else the
+one traefik-servers-transport.yaml renders). Empty off Traefik or TLS.
+*/}}
+{{- define "fortiaigate.traefikBackendAnnotations" -}}
+{{- if and .Values.tls.enabled (eq (include "fortiaigate.ingressController" .) "traefik") -}}
+traefik.ingress.kubernetes.io/service.serversscheme: https
+traefik.ingress.kubernetes.io/service.serverstransport: {{ include "fortiaigate.traefikServersTransport" . | quote }}
+{{- end -}}
+{{- end }}
+
+{{/*
+The ServersTransport reference: the operator's (<namespace>-<name>@kubernetescrd),
+or the chart's own. A reference Traefik cannot resolve drops the route at
+runtime, so a malformed one is refused here.
+*/}}
+{{- define "fortiaigate.traefikServersTransport" -}}
+{{- with ((.Values.ingress).traefik).serversTransport -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]*@[a-z]+$" .) -}}
+{{- fail (printf "ingress.traefik.serversTransport=%q: expected <namespace>-<name>@kubernetescrd" .) -}}
+{{- end -}}
+{{- . -}}
+{{- else -}}
+{{- printf "%s-fortiaigate-backend-tls@kubernetescrd" .Release.Namespace -}}
+{{- end -}}
+{{- end }}
+
+{{/* The Terraform-managed web and internal Secrets keep their existing names. */}}
 {{- define "fortiaigate.tlsSecretName" -}}
-{{- default "fortiaigate-tls-secret" .Values.tls.existingSecret }}
+{{- default "fortiaigate-external-tls-secret" .Values.tls.existingSecret -}}
 {{- end }}
 
-{{/*
-Return a checksum that changes when TLS material changes.
-When Terraform manages the TLS secret, it passes tls.existingSecretChecksum.
-When Helm manages the TLS secret, checksum the chart certificate files.
-*/}}
 {{- define "fortiaigate.tlsChecksum" -}}
-{{- if .Values.tls.existingSecretChecksum }}
-{{- .Values.tls.existingSecretChecksum }}
-{{- else }}
-{{- printf "%s%s" (tpl (.Files.Get .Values.tls.cert) $) (tpl (.Files.Get .Values.tls.key) $) | sha256sum }}
-{{- end }}
+{{- if .Values.tls.existingSecretChecksum -}}
+{{- .Values.tls.existingSecretChecksum -}}
+{{- else -}}
+{{- printf "%s%s" (tpl (.Files.Get .Values.tls.cert) $) (tpl (.Files.Get .Values.tls.key) $) | sha256sum -}}
+{{- end -}}
 {{- end }}
 
-{{/* Internal serving certificate defaults to the shared application secret. */}}
 {{- define "fortiaigate.internalTlsSecretName" -}}
-{{- default (include "fortiaigate.tlsSecretName" .) .Values.tls.internalExistingSecret -}}
+{{- default "fortiaigate-tls-secret" .Values.tls.internalExistingSecret -}}
 {{- end }}
 
 {{- define "fortiaigate.internalTlsChecksum" -}}
-{{- default (include "fortiaigate.tlsChecksum" .) .Values.tls.internalExistingSecretChecksum -}}
+{{- if .Values.tls.internalExistingSecret -}}
+{{- .Values.tls.internalExistingSecretChecksum -}}
+{{- else -}}
+{{- include "fortiaigate.internalTlsRevision" . | sha256sum -}}
+{{- end -}}
 {{- end }}
 
-{{- define "fortiaigate.dbTlsMountPath" -}}
+{{- define "fortiaigate.internalTlsMountPath" -}}
 {{- if .Values.tls.internalExistingSecret -}}
 {{- .Values.tls.internalMountPath -}}
 {{- else -}}
@@ -664,23 +841,7 @@ When Helm manages the TLS secret, checksum the chart certificate files.
 {{- end -}}
 {{- end }}
 
-{{- define "fortiaigate.dbTlsCAFile" -}}
-{{- if .Values.tls.internalExistingSecret -}}ca.crt{{- else -}}tls.crt{{- end -}}
-{{- end }}
-
-{{/* Database TLS has a separate volume only when an internal secret is set. */}}
-{{- define "fortiaigate.dbTlsVolumeMount" -}}
-{{- if and .Values.tls.internalExistingSecret (or .Values.redis.tls.enabled .Values.postgresql.tls.enabled) }}
-- name: internal-tls-certs
-  mountPath: {{ .Values.tls.internalMountPath | quote }}
-  readOnly: true
-{{- end }}
-{{- end }}
-
-{{- define "fortiaigate.dbTlsVolume" -}}
-{{- if and .Values.tls.internalExistingSecret (or .Values.redis.tls.enabled .Values.postgresql.tls.enabled) }}
-- name: internal-tls-certs
-  secret:
-    secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
-{{- end }}
+{{- define "fortiaigate.internalTlsCAFile" -}}
+{{- $name := ternary "ca.crt" "tls.crt" (not (empty .Values.tls.internalExistingSecret)) -}}
+{{- printf "%s/%s" (include "fortiaigate.internalTlsMountPath" .) $name -}}
 {{- end }}

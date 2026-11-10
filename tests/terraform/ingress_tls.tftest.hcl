@@ -13,8 +13,20 @@ run "internal_http" {
   command = apply
   variables { internal = true }
   assert {
-    condition     = tls_cert_request.internal.subject[0].common_name == "fortiaigate_postgres_user" && tls_cert_request.fortiaigate.subject[0].common_name == var.ingress_host && tls_cert_request.internal.dns_names == tls_cert_request.fortiaigate.dns_names
-    error_message = "Internal client CN must match the database role while preserving web CN and service SANs."
+    condition     = tls_cert_request.internal.subject[0].common_name == "fortiaigate_postgres_user" && tls_cert_request.fortiaigate.subject[0].common_name == var.ingress_host
+    error_message = "Internal client CN must match the database role and the web CN must match the ingress host."
+  }
+  assert {
+    condition = (
+      length(setsubtract(tls_cert_request.fortiaigate.dns_names, tls_cert_request.internal.dns_names)) == 0 &&
+      alltrue([for svc in ["action-guard", "observability", "triton-server", "vllm-server"] :
+        contains(tls_cert_request.internal.dns_names, svc) &&
+        contains(tls_cert_request.internal.dns_names, "${svc}.${var.namespace}.svc.cluster.local") &&
+        !contains(tls_cert_request.fortiaigate.dns_names, svc)
+      ]) &&
+      contains(tls_cert_request.internal.ip_addresses, "127.0.0.1")
+    )
+    error_message = "The internal certificate must retain the previous service names and cover the new services and the vLLM loopback probe."
   }
   assert {
     condition     = yamldecode(local.ingress_annotation_values[0]).ingress.annotations["alb.ingress.kubernetes.io/scheme"] == "internal" && jsondecode(yamldecode(local.ingress_annotation_values[0]).ingress.annotations["alb.ingress.kubernetes.io/listen-ports"])[0].HTTP == 80

@@ -1,0 +1,215 @@
+{{- if .Values.auth.enabled }}
+{{- $a := .Values.auth }}
+{{- if ne $a.llmWorkloadIdentity "spiffe://faig/deployment/llm-gateway" }}
+{{- fail "LLM accounting requires the standard spiffe://faig/deployment/llm-gateway workload identity" }}
+{{- end }}
+{{- if and $a.autoProvision (not $a.apiWorkloadSecretName) (ne $a.apiWorkloadIdentity "spiffe://faig/deployment/api") }}
+{{- fail "A custom API workload identity requires an existing matching API workload Secret" }}
+{{- end }}
+{{- if and $a.autoProvision (not .Values.mcpGateway.workloadTlsSecretName) (ne $a.mcpWorkloadIdentity "spiffe://faig/deployment/mcp-gateway") }}
+{{- fail "A custom MCP workload identity requires an existing matching MCP workload Secret" }}
+{{- end }}
+{{- if and $a.autoProvision (not (.Values.pluginAdapterMcp).workloadTlsSecretName) (ne $a.pluginAdapterMcpWorkloadIdentity "spiffe://faig/deployment/plugin-adapter-mcp") }}
+{{- fail "A custom plugin workload identity requires an existing matching plugin workload Secret" }}
+{{- end }}
+{{- $secret := include "fortiaigate.authSecret" (dict "root" . "override" $a.serverSecretName) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth
+  labels: {app: auth, app.kubernetes.io/part-of: fortiaigate-platform}
+spec:
+  replicas: {{ $a.replicas }}
+  selector:
+    matchLabels: {app: auth}
+  template:
+    metadata:
+      labels: {app: auth}
+      annotations:
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+        {{- end }}
+        checksum/config: {{ toJson $a | sha256sum }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      {{- with .Values.fortiaigate.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: auth
+        image: {{ .Values.fortiaigate.image.repository }}/{{ $a.image }}:{{ .Values.fortiaigate.image.tag }}
+        imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities: {drop: [ALL]}
+        resources:
+          {{- toYaml $a.resources | nindent 10 }}
+        ports:
+        - {name: workload, containerPort: 9000}
+        - {name: oauth, containerPort: 9002}
+        - {name: scim, containerPort: 9444}
+        # The mTLS port accepts workload certificates only. Public metadata
+        # confirms OAuth initialization without exposing the private listener.
+        readinessProbe:
+          httpGet: {path: /healthz, port: oauth}
+          initialDelaySeconds: 5
+          timeoutSeconds: 3
+        livenessProbe:
+          httpGet: {path: /healthz, port: oauth}
+          initialDelaySeconds: 15
+        env:
+        # Virtual-key custody uses the same persistent key as API and DP Agent.
+        - name: FAIG_MASTER_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "fortiaigate.masterKeySecretName" . }}
+              key: master-key
+        # The API session store is the revocation authority for local/SAML
+        # backend consent. Match API Redis settings, including TLS.
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef: {name: {{ include "fortiaigate.fullname" . }}-db-config, key: REDIS_HOST}
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef: {name: {{ include "fortiaigate.fullname" . }}-db-config, key: REDIS_PORT}
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: "{{ .Release.Name }}-redis", key: redis-password}
+        - {name: REDIS_SSL_VERIFY, value: "true"}
+        - {name: REDIS_SSL_ENABLED, value: {{ .Values.redis.tls.enabled | quote }}}
+        {{- if .Values.redis.tls.enabled }}
+        - {name: REDIS_SSL_CERTFILE, value: "{{ (include "fortiaigate.internalTlsMountPath" .) }}/tls.crt"}
+        - {name: REDIS_SSL_KEYFILE, value: "{{ (include "fortiaigate.internalTlsMountPath" .) }}/tls.key"}
+        - {name: REDIS_SSL_CA_CERTS, value: "{{ include "fortiaigate.internalTlsCAFile" . }}"}
+        {{- end }}
+        - {name: POSTGRES_HOST, value: "{{ .Release.Name }}-postgresql"}
+        - {name: POSTGRES_PORT, value: "{{ .Values.postgresql.primary.service.port }}"}
+        - {name: POSTGRES_DB, value: {{ .Values.postgresql.auth.database | quote }}}
+        - {name: POSTGRES_USER, value: {{ .Values.postgresql.auth.username | quote }}}
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: "{{ .Release.Name }}-postgresql", key: password}
+        - {name: POSTGRES_SSL_VERIFY, value: "true"}
+        - {name: POSTGRES_SSL_ENABLED, value: {{ .Values.postgresql.tls.enabled | quote }}}
+        {{- if .Values.postgresql.tls.enabled }}
+        - {name: POSTGRES_SSL_CA_CERTS, value: "{{ include "fortiaigate.internalTlsCAFile" . }}"}
+        - {name: POSTGRES_SSL_CERTFILE, value: "{{ (include "fortiaigate.internalTlsMountPath" .) }}/tls.crt"}
+        - {name: POSTGRES_SSL_KEYFILE, value: "{{ (include "fortiaigate.internalTlsMountPath" .) }}/tls.key"}
+        {{- end }}
+        - {name: FAIG_AUTH_LISTEN, value: ":9000"}
+        - {name: FAIG_AUTH_TLS_CERT_FILE, value: /run/faig-auth/auth.crt}
+        - {name: FAIG_AUTH_TLS_KEY_FILE, value: /run/faig-auth/auth.key}
+        - {name: FAIG_AUTH_CLIENT_CA_FILE, value: /run/faig-auth/ca.crt}
+        - name: FAIG_AUTH_SETUP_ADMIN_WORKLOADS
+          value: {{ list $a.apiWorkloadIdentity | toJson | quote }}
+        - name: FAIG_AUTH_MODULE_WORKLOADS
+          value: {{ dict $a.mcpWorkloadIdentity (list "mcp") $a.llmWorkloadIdentity (list "llm") | toJson | quote }}
+        {{- if ne (toString (.Values.pluginAdapter).legacyDevAuth) "true" }}
+        # plugin-adapter-mcp resolves the Plugins card's resource alone
+        # (agentguard.ResourceID).
+        - name: FAIG_AUTH_SETUP_PLUGIN_WORKLOADS
+          value: {{ list $a.pluginAdapterMcpWorkloadIdentity | toJson | quote }}
+        {{- end }}
+        - {name: FAIG_AUTH_VAULT_KEY_ID, value: deployment-1}
+        - {name: FAIG_AUTH_VAULT_KEY_FILE, value: /run/faig-auth/vault.key}
+        - {name: FAIG_AUTH_OAUTH_LISTEN, value: ":9002"}
+        - {name: FAIG_AUTH_OAUTH_SIGNING_KEY_ID, value: deployment-1}
+        - {name: FAIG_AUTH_OAUTH_KEY_FILE, value: /run/faig-auth/oauth-signing.key}
+        - {name: FAIG_AUTH_OAUTH_CERT_FILE, value: /run/faig-auth/oauth-signing.crt}
+        - {name: FAIG_AUTH_OAUTH_HMAC_FILE, value: /run/faig-auth/oauth-hmac.key}
+        - {name: FAIG_AUTH_UPSTREAM_TLS_VERIFY, value: {{ dig "upstreamTls" "verify" false $a | quote }}}
+        - {name: FAIG_AUTH_EGRESS_ALLOWED_HOSTS, value: {{ (dig "egress" "allowedHosts" (list) $a) | toJson | quote }}}
+        {{- if (dig "upstreamTls" "caSecretName" "" $a) }}
+        - {name: FAIG_AUTH_UPSTREAM_CA_FILE, value: /run/faig-upstream-ca/ca.crt}
+        {{- end }}
+        - {name: FAIG_AUTH_CONSOLE_BASE_PATH, value: /ui}
+        - {name: FAIG_AUTH_SCIM_LISTEN, value: ":9444"}
+        - {name: FAIG_AUTH_SCIM_CERT_FILE, value: /run/faig-auth/auth.crt}
+        - {name: FAIG_AUTH_SCIM_KEY_FILE, value: /run/faig-auth/auth.key}
+        {{- if $a.egressSecretName }}
+        - {name: FAIG_AUTH_OAUTH_EGRESS_FILE, value: /run/faig-egress/egress.json}
+        {{- end }}
+        volumeMounts:
+        - {name: identity, mountPath: /run/faig-auth, readOnly: true}
+        - {name: tmp, mountPath: /tmp}
+        {{- if (dig "upstreamTls" "caSecretName" "" $a) }}
+        - {name: upstream-ca, mountPath: /run/faig-upstream-ca, readOnly: true}
+        {{- end }}
+        {{- if or .Values.postgresql.tls.enabled .Values.redis.tls.enabled }}
+        - {name: database-tls, mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}, readOnly: true}
+        {{- end }}
+        {{- if $a.egressSecretName }}
+        - {name: egress, mountPath: /run/faig-egress, readOnly: true}
+        {{- end }}
+      volumes:
+      - name: identity
+        secret:
+          secretName: {{ $secret | quote }}
+          defaultMode: 0440
+          {{- include "fortiaigate.authSecretItems" (dict "component" "server" "override" $a.serverSecretName) | nindent 10 }}
+      - name: tmp
+        emptyDir: {}
+      {{- if (dig "upstreamTls" "caSecretName" "" $a) }}
+      - name: upstream-ca
+        secret: {secretName: {{ $a.upstreamTls.caSecretName | quote }}, defaultMode: 0440}
+      {{- end }}
+      {{- if or .Values.postgresql.tls.enabled .Values.redis.tls.enabled }}
+      - name: database-tls
+        secret: {secretName: {{ include "fortiaigate.internalTlsSecretName" . }}, defaultMode: 0440}
+      {{- end }}
+      {{- if $a.egressSecretName }}
+      - name: egress
+        secret: {secretName: {{ $a.egressSecretName | quote }}, defaultMode: 0440}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth
+spec:
+  selector: {app: auth}
+  ports:
+  - {name: workload, port: 9000, targetPort: workload}
+  - {name: oauth, port: 9002, targetPort: oauth}
+  - {name: scim, port: 9444, targetPort: scim}
+  type: ClusterIP
+{{- end }}
+
+{{- if .Values.auth.enabled }}
+{{- $controller := include "fortiaigate.ingressController" . }}
+{{- range $name, $entry := include "fortiaigate.authIngressRoutes" . | fromJson }}
+{{- if or (eq $controller "alb") (eq $name "scim") }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-{{ $name }}
+  {{- if eq $controller "alb" }}
+  annotations:
+    alb.ingress.kubernetes.io/backend-protocol: {{ $entry.protocol | quote }}
+    alb.ingress.kubernetes.io/healthcheck-protocol: "HTTP"
+    alb.ingress.kubernetes.io/healthcheck-port: "9002"
+    alb.ingress.kubernetes.io/healthcheck-path: "/healthz"
+    alb.ingress.kubernetes.io/success-codes: "200"
+  {{- else if eq $controller "traefik" }}
+  annotations:
+    traefik.ingress.kubernetes.io/service.serversscheme: https
+    traefik.ingress.kubernetes.io/service.serverstransport: {{ include "fortiaigate.traefikServersTransport" $ | quote }}
+  {{- end }}
+spec:
+  selector: {app: auth}
+  ports:
+  - name: {{ $name }}
+    port: {{ $entry.port }}
+    targetPort: {{ $name }}
+  type: ClusterIP
+{{- end }}
+{{- end }}
+{{- end }}

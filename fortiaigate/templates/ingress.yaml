@@ -1,9 +1,10 @@
-{{- $className := .Values.ingress.className }}
+{{- $className := include "fortiaigate.ingressController" . }}
 {{- $defaultAnnotations := dict }}
 {{- if eq $className "alb" }}
 {{- $_ := set $defaultAnnotations "kubernetes.io/ingress.class" "alb" }}
 {{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/scheme" "internet-facing" }}
 {{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/target-type" "ip" }}
+{{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/load-balancer-attributes" "idle_timeout.timeout_seconds=600" }}
 {{- if .Values.tls.enabled }}
 {{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/backend-protocol" "HTTPS" }}
 {{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/healthcheck-protocol" "HTTPS" }}
@@ -24,6 +25,11 @@
 {{- end }}
 {{- end }}
 {{- $annotations := mergeOverwrite (dict) $defaultAnnotations (.Values.ingress.annotations | default dict) }}
+{{- if and (eq $className "alb") .Values.inferenceHooks.enabled }}
+{{- with compact (.Values.inferenceHooks.ingress.sourceRanges | default list) }}
+{{- $_ := set $annotations "alb.ingress.kubernetes.io/conditions.inference-hooks" (list (dict "field" "source-ip" "sourceIpConfig" (dict "values" .)) | toJson) }}
+{{- end }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -44,7 +50,7 @@ spec:
   ingressClassName: {{ .Values.ingress.className }}
   {{- end }}
 
-  {{- if and .Values.tls.enabled (ne .Values.ingress.className "alb") }}
+  {{- if and .Values.tls.enabled (ne $className "alb") }}
   tls:
   - hosts:
     {{- if .Values.ingress.host }}
@@ -63,12 +69,27 @@ spec:
     - http:
     {{- end }}
         paths:
-          # webui is served under the /ui basePath. More-specific API prefixes
-          # are matched first; /ui and / route the webui; /ai routes the LLM
-          # data plane (llm-gateway), which serves that mount root and nothing
-          # outside it.
-          # /api/ carries the WHOLE management API, /api/v1 included -- one
-          # backend, no per-prefix split.
+          - path: /api/v1/plugins/claude-code
+            pathType: Prefix
+            backend:
+              service:
+                name: plugin-adapter-mcp
+                port:
+                  number: 8767
+          {{- if and (eq $className "alb") .Values.auth.enabled }}
+          {{- range $name, $entry := include "fortiaigate.authIngressRoutes" . | fromJson }}
+          {{- range $entry.paths }}
+          - path: {{ . }}
+            pathType: Prefix
+            backend:
+              service:
+                name: auth-{{ $name }}
+                port:
+                  number: {{ $entry.port }}
+          {{- end }}
+          {{- end }}
+          {{- end }}
+          # The management API handles the remaining /api/ paths.
           - path: /api/
             pathType: Prefix
             backend:
@@ -83,7 +104,17 @@ spec:
                 name: webui
                 port:
                   number: 3000
-          # Pass /ai through unchanged; llm-gateway owns this mount root.
+          # /ai -> the LLM data plane. The path is passed through UNCHANGED:
+          # llm-gateway owns this mount root itself and serves /ai/openai,
+          # /ai/anthropic, /ai/gemini (llm-gateway/internal/dialect.MountRoot).
+          #
+          # Deliberately NOT a rewrite that strips /ai. rewrite-target is
+          # annotation-scoped -- it would apply to every path in this Ingress,
+          # 404ing /api and /ui -- so stripping would need a second Ingress
+          # object, and `ingress.annotations` REPLACES the chart's defaults
+          # rather than merging, so a customer setting any annotation there
+          # would silently drop the rewrite. The gateway would then answer with
+          # a well-formed 404 and nothing anywhere would say why.
           - path: /ai
             pathType: Prefix
             backend:
@@ -91,6 +122,51 @@ spec:
                 name: llm-gateway
                 port:
                   number: 8080
+          {{- $paDev := eq (toString (.Values.pluginAdapter).legacyDevAuth) "true" }}
+          {{- if or $paDev .Values.tls.enabled }}
+          # /plugin -> the plugin adapter, in both modes. Passed through
+          # unchanged: the adapter serves /plugin/claude/v1/scan and
+          # /plugin/health/* itself, so no rewrite and no second Ingress.
+          # Managed, its Service listener serves the two health paths alone
+          # (the scans are on the pod's loopback), always over HTTPS: the
+          # route needs tls.enabled, which makes this Ingress speak HTTPS to
+          # its backends.
+          - path: /plugin
+            pathType: Prefix
+            backend:
+              service:
+                name: plugin-adapter
+                port:
+                  number: 8765
+          {{- end }}
+          # /mcp/gateways -> mcp-gateway's MCP endpoint (virtual key), and its
+          # OAuth protected-resource metadata. With tls.enabled to :8443, where
+          # the gateway serves these alone over HTTPS; else :8001. Never
+          # /internal (templates/mcp-gateway.yaml).
+          {{- $mcpPort := ternary 8443 8001 .Values.tls.enabled }}
+          - path: /mcp/gateways
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp-gateway
+                port:
+                  number: {{ $mcpPort }}
+          - path: /.well-known/oauth-protected-resource/mcp/gateways
+            pathType: Prefix
+            backend:
+              service:
+                name: mcp-gateway
+                port:
+                  number: {{ $mcpPort }}
+          {{- if and (eq $className "alb") .Values.inferenceHooks.enabled }}
+          - path: /inference-hooks
+            pathType: Prefix
+            backend:
+              service:
+                name: inference-hooks
+                port:
+                  number: 8768
+          {{- end }}
           # Root -> the console, matching the docker deployment (nginx.conf
           # sends `= /` to /ui). The gateway used to be the catch-all here, so
           # every typo landed on the data plane and came back as dialect JSON;

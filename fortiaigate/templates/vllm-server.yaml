@@ -126,6 +126,12 @@ spec:
         app.kubernetes.io/name: fortiaigate
         app.kubernetes.io/part-of: fortiaigate-platform
         app.kubernetes.io/managed-by: helm
+      {{- if include "fortiaigate.vllmTls" . }}
+      annotations:
+        # Restart the pod when the chart-generated internal certificate
+        # changes: vLLM reads the pair it serves only at start
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+      {{- end }}
     spec:
       {{- with .Values.fortiaigate.gpuWorkloadPlacement.nodeSelector }}
       nodeSelector:
@@ -172,6 +178,11 @@ spec:
       {{- include "fortiaigate.vllmContainer" (dict "root" . "colocated" false) | nindent 6 }}
       volumes:
       {{- include "fortiaigate.vllmVolumes" (dict "root" . "tp" (include "fortiaigate.vllmTensorParallel" (dict "root" . "colocated" false))) | nindent 6 }}
+      {{- if include "fortiaigate.vllmTls" . }}
+      - name: tls-certs
+        secret:
+          secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
+      {{- end }}
       {{- with .Values.fortiaigate.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

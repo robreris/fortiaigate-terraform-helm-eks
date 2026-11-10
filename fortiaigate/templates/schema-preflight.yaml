@@ -1,0 +1,77 @@
+{{- if and .Release.IsUpgrade .Values.api.schemaPreflight.enabled }}
+{{- $postgres := .Subcharts.postgresql }}
+# This Job only reads the existing database. Helm waits for it before changing
+# any release resources, including Deployments. Maintenance never runs here:
+# pre-upgrade hooks still have live application writers.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-schema-preflight" .Release.Name | trunc 63 | trimSuffix "-" }}
+  annotations:
+    helm.sh/hook: pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.api.schemaPreflight.timeoutSeconds }}
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.fortiaigate.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: preflight
+          image: {{ .Values.fortiaigate.image.repository }}/api:{{ .Values.fortiaigate.image.tag }}
+          imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
+          command: [/home/appuser/schema-maintenance]
+          args: ["--mode=preflight", "--timeout={{ .Values.api.schemaPreflight.timeoutSeconds }}s"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+          env:
+            - name: POSTGRES_HOST
+              value: {{ include "postgresql.v1.primary.fullname" $postgres | quote }}
+            - name: POSTGRES_PORT
+              value: {{ .Values.postgresql.primary.service.port | quote }}
+            - name: POSTGRES_USER
+              value: {{ include "postgresql.v1.username" $postgres | quote }}
+            - name: POSTGRES_DB
+              value: {{ include "postgresql.v1.database" $postgres | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "postgresql.v1.secretName" $postgres | quote }}
+                  key: {{ include "postgresql.v1.userPasswordKey" $postgres | quote }}
+            - name: POSTGRES_SSL_ENABLED
+              value: {{ .Values.postgresql.tls.enabled | quote }}
+            {{- if .Values.postgresql.tls.enabled }}
+            - {name: POSTGRES_SSL_CERTFILE, value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}}
+            - {name: POSTGRES_SSL_KEYFILE, value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}}
+            - {name: POSTGRES_SSL_CA_CERTS, value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}}
+            - {name: POSTGRES_SSL_VERIFY, value: "true"}
+          volumeMounts:
+            - name: postgres-tls
+              mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) }}
+              readOnly: true
+      volumes:
+        - name: postgres-tls
+          secret:
+            secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
+            defaultMode: 0440
+      {{- end }}
+{{- end }}

@@ -1,0 +1,476 @@
+{{- /*
+inference-hooks: FortiAIGate's endpoint for Anthropic's Inference hooks
+(Claude Enterprise). Anthropic's servers POST each signed
+frame (a prompt, a tool call) to /inference-hooks/claude/v1/<endpoint id>;
+the server judges it with the policies of the person's key and answers allow
+or deny. Off by default (inferenceHooks.enabled).
+
+The pod listens on :8768 with the platform certificate when tls.enabled, as
+every backend the platform ingress routes does, so the ingress speaks HTTPS to
+it then. The public TLS ends at the ingress, with the platform certificate
+(tls.cert / tls.key), which Anthropic must trust: it must be a public CA's.
+
+The hook route is its own Ingress object (fortiaigate-inference-hooks),
+rendered with the server, for /inference-hooks: the frames and the health
+paths. It shares the platform ingress's class, host (ingress.host) and
+certificate, as auth's routes do (auth-ingress.yaml). Only its annotations
+are its own: a 64m body (Anthropic's limit on a frame), a 15 s read timeout
+(the verdict budget is at most 10 s, the server's write timeout 15 s) and the
+source-address restriction (inferenceHooks.ingress.sourceRanges), which
+covers the health paths too. On the platform's
+host it wins over the catch-all / as the longer prefix; no other platform
+route is under /inference-hooks. It has no switch: without it, that catch-all
+would send Anthropic's frames to the console.
+
+The card is inferenceHooks.card, required: its signing secret and header
+value in the Secret inference-hooks-card, the rest in the environment. Its
+console page and API come in a later release.
+*/ -}}
+{{- if (.Values.inferenceHooks).enabled }}
+{{- $ih := .Values.inferenceHooks }}
+{{- $ing := $ih.ingress | default dict }}
+{{- $env := $ih.env | default dict }}
+{{- $controller := include "fortiaigate.ingressController" . }}
+{{- $card := $ih.card | default dict }}
+{{- $hdr := $card.requestHeader | default dict }}
+{{- if not (regexMatch "^[0-9a-f]{32}$" (toString ($card.endpointId | default ""))) }}
+{{- fail "inferenceHooks.card.endpointId: expected 32 lowercase hex characters (openssl rand -hex 16); inferenceHooks.enabled needs the card" }}
+{{- end }}
+{{- if not (hasPrefix "whsec_" (toString ($card.signingSecret | default ""))) }}
+{{- fail "inferenceHooks.card.signingSecret: expected the signing secret that claude.ai reveals (whsec_...); inferenceHooks.enabled needs the card" }}
+{{- end }}
+{{- if and (eq (toString $card.unmappedActor) "fallback_key") (not $card.fallbackKeyId) }}
+{{- fail "inferenceHooks.card.unmappedActor=fallback_key needs inferenceHooks.card.fallbackKeyId" }}
+{{- end }}
+{{- /* The server runs without Redis when REDIS_HOST and REDIS_ADDR are both
+unset: its replay cache and conversation cursor are then in the process. */}}
+{{- $redis := ne (toString (.Values.redis).enabled) "false" }}
+{{- if and (not $redis) (gt (int $ih.replicas) 1) }}
+{{- fail (printf "inferenceHooks.replicas=%v needs Redis, and redis.enabled is false: without it the replay cache and the conversation cursor are held in each process, so a retried frame can be judged twice. Set inferenceHooks.replicas=1" $ih.replicas) }}
+{{- end }}
+{{- /* Every variable the container below sets. inferenceHooks.env may not
+repeat one (a second entry would silently override or be overridden), but for
+INFERENCE_HOOKS_GATEWAY_HOSTS, which replaces the chart's. Keep the list in
+step with the env block. */}}
+{{- $owned := list "INFERENCE_HOOKS_CARD_ENDPOINT_ID" "INFERENCE_HOOKS_CARD_ORGANIZATION_ID" "INFERENCE_HOOKS_CARD_SIGNING_SECRET" "INFERENCE_HOOKS_CARD_HEADER_NAME" "INFERENCE_HOOKS_CARD_HEADER_VALUE" "INFERENCE_HOOKS_CARD_TENANT_ID" "INFERENCE_HOOKS_CARD_UNMAPPED_ACTOR" "INFERENCE_HOOKS_CARD_FALLBACK_KEY_ID" "INFERENCE_HOOKS_CARD_REDACTION_VERDICT" "INFERENCE_HOOKS_CARD_FAIL_MODE" "INFERENCE_HOOKS_CARD_SCAN_TIMEOUT_MS" "FAIG_MEMORY_LIMIT_BYTES" "FAIG_MAX_INFLIGHT_BYTES" "INFERENCE_HOOKS_LISTEN_ADDR" "INFERENCE_HOOKS_LICENSE_IDENTITY" "FAIG_INTERNAL_TOKEN" "FAIG_GUARDRAIL_ADDR" "FAIG_GUARDRAIL_TLS" "FAIG_GUARDRAIL_TLS_CA_FILE" "FAIG_GUARDRAIL_TLS_CERT_FILE" "FAIG_GUARDRAIL_TLS_KEY_FILE" "FAIG_INTERNAL_TLS_CA_FILE" "FAIG_INTERNAL_TLS_CERT_FILE" "FAIG_INTERNAL_TLS_KEY_FILE" "GUARDRAIL_MAX_REQUEST_BYTES" "ACTION_GUARD_URL" "OBSERVABILITY_URL" "FORTIAIGATE_LOG_LEVEL" "FORTIAIGATE_SSL_CERT_FILE" "FORTIAIGATE_SSL_KEY_FILE" "POSTGRES_SSL_VERIFY" "POSTGRES_SSL_ENABLED" "POSTGRES_SSL_CERTFILE" "POSTGRES_SSL_KEYFILE" "POSTGRES_SSL_CA_CERTS" "POSTGRES_USER" "POSTGRES_PASSWORD" "POSTGRES_DB" "POSTGRES_HOST" "POSTGRES_PORT" "REDIS_HOST" "REDIS_PORT" "REDIS_PASSWORD" "REDIS_SSL_VERIFY" "REDIS_SSL_ENABLED" "REDIS_SSL_CERTFILE" "REDIS_SSL_KEYFILE" "REDIS_SSL_CA_CERTS" }}
+{{- range $k, $v := $env }}
+{{- if ne $k "maxInflightBytes" }}
+{{- if not (regexMatch "^[A-Z_][A-Z0-9_]*$" $k) }}
+{{- fail (printf "inferenceHooks.env.%s: expected maxInflightBytes or the name of an environment variable (UPPER_CASE)" $k) }}
+{{- end }}
+{{- if has $k $owned }}
+{{- fail (printf "inferenceHooks.env.%s is set by the chart (templates/inference-hooks.yaml); remove it and set the value it comes from" $k) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- /* The public host name of this deployment, the platform's, which the
+hook route shares. The server takes a third-party tool on it for the
+FortiAIGate MCP gateway's. */}}
+{{- $gatewayHosts := compact (list .Values.ingress.host) }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: inference-hooks-card
+  labels:
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+type: Opaque
+data:
+  signing-secret: {{ $card.signingSecret | toString | b64enc | quote }}
+  header-value: {{ $hdr.value | default "" | toString | b64enc | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference-hooks
+  labels:
+    app: inference-hooks
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+spec:
+  replicas: {{ $ih.replicas }}
+  strategy:
+    type: {{ .Values.fortiaigate.updateStrategy }}
+  selector:
+    matchLabels:
+      app: inference-hooks
+  template:
+    metadata:
+      annotations:
+        checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+        {{- end }}
+        # The server reads the card at start: a change of it rolls the pods.
+        checksum/card: {{ toJson $card | sha256sum }}
+      labels:
+        app: inference-hooks
+    spec:
+      # No serviceAccountName: the licence client reads the deployment
+      # identity (the cluster CA and the namespace) from the ServiceAccount
+      # files the kubelet mounts, as in plugin-adapter's pod. Without them
+      # every poll is refused and each frame is answered as unlicensed.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: inference-hooks
+        image: {{ .Values.fortiaigate.image.repository }}/inference-hooks:{{ .Values.fortiaigate.image.tag }}
+        imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - containerPort: 8768
+          name: http
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /inference-hooks/health/readiness
+            port: http
+            {{- if .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          # Ready once the config snapshots are loaded, never on the licence,
+          # the card, the database or the guardrail: without them the server
+          # stays in rotation and answers each frame with a status Anthropic
+          # reads.
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /inference-hooks/health/liveness
+            port: http
+            {{- if .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          {{- toYaml $ih.resources | nindent 10 }}
+        env:
+        {{- if (($ih.resources).limits).memory }}
+        # The server derives its memory admission budget (a quarter) AND
+        # GOMEMLIMIT (nine tenths) from this, as llm-gateway and plugin-adapter
+        # do, so changing resources.limits.memory moves both. Guarded on the
+        # limit existing: without one, resourceFieldRef falls back to the
+        # NODE's allocatable memory.
+        - name: FAIG_MEMORY_LIMIT_BYTES
+          valueFrom:
+            resourceFieldRef:
+              containerName: inference-hooks
+              resource: limits.memory
+              divisor: "1"
+        {{- end }}
+        {{- with $env.maxInflightBytes }}
+        # Absolute override; normally UNSET so the value above governs.
+        - name: FAIG_MAX_INFLIGHT_BYTES
+          value: {{ . | quote }}
+        {{- end }}
+        - name: INFERENCE_HOOKS_LISTEN_ADDR
+          value: ":8768"
+        # The licence manager's caller identity: may it serve, may it scan.
+        - name: INFERENCE_HOOKS_LICENSE_IDENTITY
+          value: "inference-hooks"
+        {{- if and $gatewayHosts (not (hasKey $env "INFERENCE_HOOKS_GATEWAY_HOSTS")) }}
+        - name: INFERENCE_HOOKS_GATEWAY_HOSTS
+          value: {{ join "," $gatewayHosts | quote }}
+        {{- end }}
+        # The card (inferenceHooks.card).
+        - name: INFERENCE_HOOKS_CARD_ENDPOINT_ID
+          value: {{ $card.endpointId | quote }}
+        - name: INFERENCE_HOOKS_CARD_ORGANIZATION_ID
+          value: {{ $card.organizationId | default "" | quote }}
+        - name: INFERENCE_HOOKS_CARD_SIGNING_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: inference-hooks-card
+              key: signing-secret
+        - name: INFERENCE_HOOKS_CARD_HEADER_NAME
+          value: {{ $hdr.name | default "X-FAIG-Hook-Token" | quote }}
+        - name: INFERENCE_HOOKS_CARD_HEADER_VALUE
+          valueFrom:
+            secretKeyRef:
+              name: inference-hooks-card
+              key: header-value
+        - name: INFERENCE_HOOKS_CARD_TENANT_ID
+          value: {{ $card.tenantId | default "" | quote }}
+        - name: INFERENCE_HOOKS_CARD_UNMAPPED_ACTOR
+          value: {{ $card.unmappedActor | default "deny" | quote }}
+        - name: INFERENCE_HOOKS_CARD_FALLBACK_KEY_ID
+          value: {{ $card.fallbackKeyId | default "" | quote }}
+        - name: INFERENCE_HOOKS_CARD_REDACTION_VERDICT
+          value: {{ $card.redactionVerdict | default "deny" | quote }}
+        - name: INFERENCE_HOOKS_CARD_FAIL_MODE
+          value: {{ $card.failMode | default "webhook_failure" | quote }}
+        - name: INFERENCE_HOOKS_CARD_SCAN_TIMEOUT_MS
+          value: {{ $card.scanTimeoutMs | default 3500 | toString | quote }}
+        # Signs the companion admissions to Observability and Action Guard,
+        # which verify them with the same Secret (FAIG_MCP_ADMISSION_KEY), as
+        # a managed plugin-adapter's.
+        - name: FAIG_INTERNAL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "fortiaigate.internalTokenSecretName" . }}
+              key: internal-token
+        # The guardrail dispatcher pool: the gateway's, from the same value, as
+        # plugin-adapter takes it. TLS to it follows the platform switch: the
+        # pool serves TLS exactly when the platform cert is mounted, and this
+        # pod carries the same mount.
+        - name: FAIG_GUARDRAIL_ADDR
+          value: {{ (.Values.llmGateway.env).guardrailAddr | default "guardrail:50051" | quote }}
+        - name: FAIG_GUARDRAIL_TLS
+          value: {{ .Values.tls.enabled | ternary "verify" "off" | quote }}
+        {{- if .Values.tls.enabled }}
+        - name: FAIG_GUARDRAIL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: FAIG_INTERNAL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        - name: FAIG_GUARDRAIL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_GUARDRAIL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
+        {{- end }}
+        # The guardrail's scan limit, from the value guardrail.yaml gives the
+        # dispatcher: above it, the oldest blocks of a transcript are left out
+        # first.
+        - name: GUARDRAIL_MAX_REQUEST_BYTES
+          value: {{ ((.Values.guardrail).env).maxRequestBytes | default "10485760" | quote }}
+        # Each new tool call and tool result judged by Action Guard (always
+        # deployed) with the key's MCP policies, in the conversation's history,
+        # as on the plugin path.
+        - name: ACTION_GUARD_URL
+          value: {{ include "fortiaigate.companionURL" (dict "root" $ "name" "action-guard" "port" 8002) | quote }}
+        # Each conversation registered in Observability, where Action Guard
+        # reads its history and the console's Agent Sessions show it.
+        - name: OBSERVABILITY_URL
+          value: {{ include "fortiaigate.companionURL" (dict "root" $ "name" "observability" "port" 8004) | quote }}
+        - name: FORTIAIGATE_LOG_LEVEL
+          value: {{ .Values.fortiaigate.env.logLevel | quote }}
+        {{- if .Values.tls.enabled }}
+        # HTTPS on :8768 with the external certificate (tls.cert), as every
+        # listener the ingress routes to serves it: the ingress's backend
+        # protocol and the probes' scheme follow tls.enabled. The hops this pod
+        # dials trust the internal certificate.
+        - name: FORTIAIGATE_SSL_CERT_FILE
+          value: "/etc/tls-external/tls.crt"
+        - name: FORTIAIGATE_SSL_KEY_FILE
+          value: "/etc/tls-external/tls.key"
+        {{- end }}
+        # The database: the compiled config snapshots, the users and their
+        # keys, the external URL.
+        - name: POSTGRES_SSL_VERIFY
+          value: "true"
+        - name: POSTGRES_SSL_ENABLED
+          value: {{ .Values.postgresql.tls.enabled | quote }}
+        {{- if .Values.postgresql.tls.enabled }}
+        - name: POSTGRES_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- end }}
+        - name: POSTGRES_USER
+          value: "{{ .Values.postgresql.auth.username }}"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-postgresql
+              key: password
+        - name: POSTGRES_DB
+          value: "{{ .Values.postgresql.auth.database }}"
+        - name: POSTGRES_HOST
+          value: "{{ .Release.Name }}-postgresql"
+        - name: POSTGRES_PORT
+          value: "{{ .Values.postgresql.primary.service.port }}"
+        {{- if $redis }}
+        # The shared Redis's database 0 (REDIS_DB unset), as plugin-adapter's:
+        # the replay cache, the conversation cursor and the Observability
+        # session ids every replica shares. Without the chart's Redis none is
+        # set: the server then keeps those caches in the process (one replica,
+        # refused above).
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_HOST
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_PORT
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-redis
+              key: redis-password
+        - name: REDIS_SSL_VERIFY
+          value: "true"
+        - name: REDIS_SSL_ENABLED
+          value: {{ .Values.redis.tls.enabled | quote }}
+        {{- if .Values.redis.tls.enabled }}
+        - name: REDIS_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- end }}
+        {{- end }}
+        {{- with omit $env "maxInflightBytes" }}
+        # The rest of inferenceHooks.env, verbatim.
+        {{- range $k, $v := . }}
+        - name: {{ $k }}
+          value: {{ $v | quote }}
+        {{- end }}
+        {{- end }}
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        - name: tls-certs
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
+          readOnly: true
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        - name: external-tls-certs
+          mountPath: /etc/tls-external
+          readOnly: true
+        {{- end }}
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+      - name: tls-certs
+        secret:
+          secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
+          defaultMode: 0440
+      {{- end }}
+      {{- if .Values.tls.enabled }}
+      - name: external-tls-certs
+        secret:
+          secretName: {{ include "fortiaigate.tlsSecretName" . }}
+          defaultMode: 0440
+      {{- end }}
+      {{- with .Values.fortiaigate.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference-hooks
+  labels:
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+  {{- $traefik := include "fortiaigate.traefikBackendAnnotations" . }}
+  {{- if or (eq $controller "alb") $traefik }}
+  annotations:
+    {{- if eq $controller "alb" }}
+    # An ALB target group checks / by default, which this server answers 404.
+    alb.ingress.kubernetes.io/healthcheck-path: /inference-hooks/health/readiness
+    {{- end }}
+    {{- with $traefik }}
+    {{- . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  selector:
+    app: inference-hooks
+  ports:
+  - protocol: TCP
+    port: 8768
+    targetPort: 8768
+    name: http
+  type: ClusterIP
+{{- if ne $controller "alb" }}
+{{- /* The certificate the ingress ends the public TLS with: the platform's
+(with tls.enabled), the one certificate of the one host. An ALB takes its
+certificate from ACM, not from a Secret, as the platform ingress. */}}
+{{- $tlsSecret := ternary (include "fortiaigate.tlsSecretName" .) "" .Values.tls.enabled }}
+{{- $backend := ternary "HTTPS" "HTTP" .Values.tls.enabled }}
+{{- /* compact: `--set ...sourceRanges={}` gives [""], which is no range. */}}
+{{- $ranges := compact ($ing.sourceRanges | default list) }}
+{{- $ann := dict }}
+{{- if eq $controller "nginx" }}
+{{- $_ := set $ann "nginx.ingress.kubernetes.io/backend-protocol" $backend }}
+{{- $_ := set $ann "nginx.ingress.kubernetes.io/proxy-body-size" "64m" }}
+{{- $_ := set $ann "nginx.ingress.kubernetes.io/proxy-read-timeout" "15" }}
+{{- with $ranges }}
+{{- $_ := set $ann "nginx.ingress.kubernetes.io/whitelist-source-range" (join "," .) }}
+{{- end }}
+{{- else if and (eq $controller "traefik") $tlsSecret }}
+{{- /* Traefik dials the backend over HTTPS from the Service's annotations
+(above); the source restriction needs an ipAllowList Middleware of the operator's,
+named in inferenceHooks.ingress.annotations. */}}
+{{- $_ := set $ann "traefik.ingress.kubernetes.io/router.entrypoints" "websecure" }}
+{{- end }}
+{{- range $k, $v := ($ing.annotations | default dict) }}
+{{- $_ := set $ann $k (toString $v) }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fortiaigate-inference-hooks
+  labels:
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+  {{- with $ann }}
+  annotations:
+    {{- range $k, $v := . }}
+    {{ $k }}: {{ $v | quote }}
+    {{- end }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if and $tlsSecret (ne $controller "alb") }}
+  tls:
+  - secretName: {{ $tlsSecret | quote }}
+    {{- with .Values.ingress.host }}
+    hosts: [{{ . | quote }}]
+    {{- end }}
+  {{- end }}
+  rules:
+  - {{- with .Values.ingress.host }}
+    host: {{ . | quote }}
+    {{- end }}
+    http:
+      paths:
+      # All of /inference-hooks, passed through unchanged (no rewrite): the
+      # server serves /inference-hooks/claude/v1/<endpoint id> and
+      # /inference-hooks/health/* itself, and answers 404 to the rest.
+      - path: /inference-hooks
+        pathType: Prefix
+        backend:
+          service:
+            name: inference-hooks
+            port:
+              number: 8768
+{{- end }}
+{{- end }}

@@ -10,7 +10,7 @@ aws_region   = "us-west-2"
 cluster_name = "fortiaigate-public"
 
 # REQUIRED — your FortiAIGate image registry.
-image_repository = "123456789.dkr.ecr.us-west-2.amazonaws.com/fortiaigate"
+image_repository = "123456789.dkr.ecr.us-west-2.amazonaws.com/fortiaigate-v803"
 
 ingress_class                        = "alb"
 internal                             = false

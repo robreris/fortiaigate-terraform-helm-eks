@@ -114,6 +114,11 @@ spec:
         # Triton reads the model config only when it starts, so a change to it
         # (triton.dlpInstancesPerGpu, for one) must restart the pod to apply.
         checksum/model-config: {{ include "fortiaigate.tritonDlpModelConfig" . | sha256sum }}
+        {{- if .Values.tls.enabled }}
+        # Likewise the internal certificate Triton (and a co-located vLLM)
+        # serves: read only at start, so a new one restarts the pod.
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+        {{- end }}
         {{- if $colocated }}
         # gpu-probe runs ONCE, at pod start, from the script the
         # triton-vllm-server-gpu-probe ConfigMap carries. The kubelet refreshes a
@@ -269,6 +274,22 @@ spec:
           - --grpc-http2-max-pings-without-data=0
           - --grpc-http2-min-recv-ping-interval-without-data=10000
           - --grpc-http2-max-ping-strikes=0
+          {{- if .Values.tls.enabled }}
+          # gRPC (the DLP scanner's port) over TLS on the internal certificate,
+          # whose SANs carry triton-server; dlp-scanner verifies it
+          # (TRITON_TLS, guardrail.yaml). HTTP :8000 (the probes) and
+          # metrics :8002 stay plaintext: Triton serves no TLS there.
+          - --grpc-use-ssl=true
+          - --grpc-server-cert={{ (include "fortiaigate.internalTlsMountPath" .) }}/tls.crt
+          - --grpc-server-key={{ (include "fortiaigate.internalTlsMountPath" .) }}/tls.key
+          {{- end }}
+          {{- if include "fortiaigate.internalMtls" . }}
+          # Mutual TLS (tls.mutual): the gRPC port also requires the client's
+          # certificate, verified against the internal one, which dlp-scanner
+          # presents (FAIG_INTERNAL_TLS_CERT_FILE, guardrail.yaml).
+          - --grpc-use-ssl-mutual=true
+          - --grpc-root-cert={{ include "fortiaigate.internalTlsCAFile" . }}
+          {{- end }}
         ports:
         - containerPort: 8000
           name: http
@@ -342,6 +363,11 @@ spec:
           subPath: sensitive_model-config.pbtxt
         - name: shm-memory
           mountPath: /dev/shm
+        {{- if .Values.tls.enabled }}
+        - name: tls-certs
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
+          readOnly: true
+        {{- end }}
         # Building the FP16 TensorRT engine for the ~1.1 GB sensitive_model
         # (GLiNER on xlm-roberta-large; 15-25 min was measured on the earlier
         # 1.8 GB DeBERTa export, and this one is of the same order) can take
@@ -401,6 +427,12 @@ spec:
         emptyDir:
           medium: Memory
           sizeLimit: 6Gi
+      {{- if .Values.tls.enabled }}
+      # The internal certificate, for Triton and, co-located, vLLM.
+      - name: tls-certs
+        secret:
+          secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
+      {{- end }}
       {{- if $colocated }}
       - name: gpu-probe
         configMap:
@@ -589,11 +621,11 @@ metadata:
 data:
   sensitive_model-config.pbtxt: |
 {{ include "fortiaigate.tritonDlpModelConfig" . | indent 4 }}
-{{- end }}
 {{- /*
 The DLP model's config.pbtxt. A named template so the Deployment can hash it:
 the pod restarts when it changes, which is the only way Triton re-reads it.
 */ -}}
+{{- end }}
 {{- define "fortiaigate.tritonDlpModelConfig" -}}
 {{- /* values.yaml when set there, else the fortiaigate.gpu.type profile
        (files/gpu-profiles.yaml: 1 in default, 3 on rtx-pro-6000). Refused by

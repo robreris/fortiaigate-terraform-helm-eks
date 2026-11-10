@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- Verified FortiAIGate 8.0.3 build 6207 image inventory and [ECR staging instructions](docs/images-build6207.md) with a Bash upload script for all 18 supplied Docker archives.
+
 - Read-only VPC teardown checks for load balancers, target groups and network interfaces, a VPC ID output, and recovery guidance for subnet/internet gateway dependency errors. Require AWS load balancer cleanup verification before removing controllers in the documented workflow.
 - Apache-2.0 LICENSE and NOTICE files, contribution guidance, security policy, and project roadmap.
 - Runnable examples for nginx, internal ALB, and internet-facing ALB deployments.
@@ -17,6 +19,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - CI formatting, Terraform validation, TFLint, Helm lint, chart/GPU/ingress render checks, mocked Terraform validation tests, and real certificate checks.
 
 ### Changed
+
+- Port the FortiAIGate 8.0.3 build 6207 chart on `v803`, including Auth, new application workloads, and database preflight. Keep the existing EFS claim, EKS GPU placement, Terraform-managed TLS Secrets, and ALB, and use the `fortiaigate-v803` ECR prefix in deployment examples.
 
 - Reserve `10.0.48.0/20` for public subnets when expanding AZ coverage. Assign private subnet index 3 to `10.0.96.0/20`, preserving original subnets and private subnets already created at indexes 4 and 5 during a partial expansion.
 - Create subnets in every available regional Availability Zone and allow GPU nodes in every zone offering the selected instance type. Preserve the original cluster/application subnet selection; expanding GPU placement replaces the GPU node group.

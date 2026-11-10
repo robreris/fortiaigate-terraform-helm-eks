@@ -1,3 +1,6 @@
+{{- if and (not .Values.auth.enabled) (gt (int .Values.llmGateway.replicas) 0) }}
+{{- fail "LLM RBAC accounting requires bundled Auth. Enable auth.enabled, or set llmGateway.replicas=0 for an external-Auth MCP-only deployment." }}
+{{- end }}
 # Core Deployment
 apiVersion: apps/v1
 kind: Deployment
@@ -18,10 +21,12 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
-        checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
         # This is the key that triggers a restart when TLS certificates change
-        checksum/config: {{ printf "%s%s" (tpl (.Files.Get .Values.tls.cert) $) (tpl (.Files.Get .Values.tls.key) $) | sha256sum }}
+        checksum/auth: {{ toJson .Values.auth | sha256sum }}
+        checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+        {{- end }}
       labels:
         app: llm-gateway
     spec:
@@ -72,6 +77,13 @@ spec:
         resources:
           {{- toYaml .Values.llmGateway.resources | nindent 10 }}
         env:
+        {{- if .Values.auth.enabled }}
+        - {name: FAIG_AUTH_URL, value: "https://auth:9000"}
+        - {name: FAIG_AUTH_WORKLOAD_CERT_FILE, value: /run/faig-auth/tls.crt}
+        - {name: FAIG_AUTH_WORKLOAD_KEY_FILE, value: /run/faig-auth/tls.key}
+        - {name: FAIG_AUTH_SERVER_CA_FILE, value: /run/faig-auth/ca.crt}
+        # Usage accounting needs Auth; inbound LLM OAuth remains unsupported.
+        {{- end }}
         {{- if .Values.llmGateway.resources.limits.memory }}
         # The gateway derives its admission budget AND GOMEMLIMIT from this, so
         # changing resources.limits.memory below moves both without a second
@@ -96,14 +108,6 @@ spec:
           value: {{ .Values.llmGateway.env.logRedisPoolSize | quote }}
         - name: UPSTREAM_LLM_REQUEST_TIMEOUT
           value: {{ .Values.llmGateway.env.upstreamLlmRequestTimeout | quote }}
-        # Mirrors the scanner-side truncation limit. Core does not truncate; this value is
-        # mixed into the scanner-cache key so changes to maxScanChars invalidate stale entries.
-        # SCANNER_MAX_SCAN_CHARS is the global fallback used when a scanner name is not in
-        # the per-scanner JSON map below.
-        - name: SCANNER_MAX_SCAN_CHARS
-          value: {{ .Values.guardrail.env.maxScanChars | quote }}
-        - name: SCANNER_MAX_SCAN_CHARS_BY_NAME
-          value: {{ include "fortiaigate.scannerMaxCharsByName" . | quote }}
         # The guardrail dispatcher pool (faig.guardrail.v1/Scan) the guard
         # stages call. TLS posture is inferred in-process from
         # FORTIAIGATE_SSL_CERT_FILE — the pool serves TLS exactly when the
@@ -111,19 +115,23 @@ spec:
         # "off" disables scanning (dev only: content is then NOT inspected).
         - name: FAIG_GUARDRAIL_ADDR
           value: {{ (.Values.llmGateway.env).guardrailAddr | default "guardrail:50051" | quote }}
-        {{- with ((.Values.llmGateway.env).inStream).chunkBytes }}
-        # The in_stream sliding window (docs/workflows/in-stream-scan.md).
-        # Rendered only when set, so the binary's defaults (4096 / 1024)
+        {{- with ((.Values.llmGateway.env).inStream).windowChars }}
+        # The in_stream window, in characters (docs/workflows/in-stream-scan.md).
+        # Rendered only when set, so the binary's defaults (1024 / 256)
         # stay the single source of truth.
-        - name: FAIG_INSTREAM_CHUNK_BYTES
+        - name: FAIG_INSTREAM_WINDOW_CHARS
           value: {{ . | quote }}
         {{- end }}
-        {{- with ((.Values.llmGateway.env).inStream).overlapBytes }}
-        - name: FAIG_INSTREAM_OVERLAP_BYTES
+        {{- with ((.Values.llmGateway.env).inStream).holdbackChars }}
+        - name: FAIG_INSTREAM_HOLDBACK_CHARS
           value: {{ . | quote }}
         {{- end }}
         - name: UPSTREAM_TLS_VERIFY
           value: {{ .Values.llmGateway.env.upstreamTls.verify | quote }}
+        - name: PASSTHROUGH_TLS_VERIFY
+          value: {{ .Values.llmGateway.env.upstreamTls.verify | quote }}
+        - name: PASSTHROUGH_REFUSE_PRIVATE_TARGETS
+          value: {{ (.Values.llmGateway.env.passthroughRefusePrivateTargets | default false) | quote }}
         # Bifrost core >= v1.10 refuses to dial RFC 1918 hosts unless told
         # otherwise. A per-org endpoint override onto the cluster network (a
         # self-hosted vLLM, an on-prem proxy) is exactly that case, so the
@@ -157,30 +165,47 @@ spec:
         {{- . | nindent 8 }}
         {{- end }}
         {{- if .Values.tls.enabled }}
+        # The external certificate: what clients reach through the Ingress
         - name: FORTIAIGATE_SSL_CERT_FILE
-          value: {{ printf "%s/tls.crt" .Values.tls.mountPath | quote }}
+          value: "/etc/tls-external/tls.crt"
         - name: FORTIAIGATE_SSL_KEY_FILE
-          value: {{ printf "%s/tls.key" .Values.tls.mountPath | quote }}
+          value: "/etc/tls-external/tls.key"
+        # The internal certificate, which the guardrail pool and the licence
+        # manager serve: the CA this pod verifies them against
+        - name: FAIG_INTERNAL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        # Mutual TLS (tls.mutual): the client certificate this pod presents to
+        # the servers that require one, the internal pair itself
+        - name: FAIG_INTERNAL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
         {{- end }}
         - name: REDIS_SSL_ENABLED
           value: {{ .Values.redis.tls.enabled | quote }}
         {{- if .Values.redis.tls.enabled }}
         - name: REDIS_SSL_CERTFILE
-          value: {{ printf "%s/tls.crt" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: REDIS_SSL_KEYFILE
-          value: {{ printf "%s/tls.key" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: REDIS_SSL_CA_CERTS
-          value: {{ printf "%s/%s" (include "fortiaigate.dbTlsMountPath" .) (include "fortiaigate.dbTlsCAFile" .) | quote }}
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: REDIS_SSL_VERIFY
+          value: "true"
         {{- end }}
         - name: POSTGRES_SSL_ENABLED
           value: {{ .Values.postgresql.tls.enabled | quote }}
         {{- if .Values.postgresql.tls.enabled }}
         - name: POSTGRES_SSL_CERTFILE
-          value: {{ printf "%s/tls.crt" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: POSTGRES_SSL_KEYFILE
-          value: {{ printf "%s/tls.key" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: POSTGRES_SSL_CA_CERTS
-          value: {{ printf "%s/%s" (include "fortiaigate.dbTlsMountPath" .) (include "fortiaigate.dbTlsCAFile" .) | quote }}
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: POSTGRES_SSL_VERIFY
+          value: "true"
         {{- end }}
         # Database configuration (only what's actually used by the application)
         - name: REDIS_HOST
@@ -213,6 +238,9 @@ spec:
         - name: POSTGRES_PORT
           value: "{{ .Values.postgresql.primary.service.port }}"
         volumeMounts:
+        {{- if .Values.auth.enabled }}
+        - {name: auth-workload, mountPath: /run/faig-auth, readOnly: true}
+        {{- end }}
         - name: shared-data
           mountPath: /etc/fortiaigate/
           readOnly: false
@@ -220,11 +248,22 @@ spec:
           mountPath: /tmp
         {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
         - name: tls-certs
-          mountPath: {{ .Values.tls.mountPath | quote }}
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
           readOnly: true
         {{- end }}
-      {{- include "fortiaigate.dbTlsVolumeMount" . | nindent 8 }}
+        {{- if .Values.tls.enabled }}
+        - name: external-tls-certs
+          mountPath: /etc/tls-external
+          readOnly: true
+        {{- end }}
       volumes:
+      {{- if .Values.auth.enabled }}
+      - name: auth-workload
+        secret:
+          secretName: {{ include "fortiaigate.authSecret" (dict "root" . "override" .Values.auth.llmWorkloadSecretName) | quote }}
+          {{- include "fortiaigate.authSecretItems" (dict "component" "llm" "override" .Values.auth.llmWorkloadSecretName) | nindent 10 }}
+          defaultMode: 0440
+      {{- end }}
       - name: shared-data
         persistentVolumeClaim:
           claimName: {{ include "fortiaigate.fullname" . }}-storage
@@ -233,9 +272,13 @@ spec:
       {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
       - name: tls-certs
         secret:
+          secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
+      {{- end }}
+      {{- if .Values.tls.enabled }}
+      - name: external-tls-certs
+        secret:
           secretName: {{ include "fortiaigate.tlsSecretName" . }}
       {{- end }}
-      {{- include "fortiaigate.dbTlsVolume" . | nindent 6 }}
       {{- with .Values.fortiaigate.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -245,10 +288,15 @@ apiVersion: v1
 kind: Service
 metadata:
   name: llm-gateway
-  {{- if eq .Values.ingress.className "alb" }}
+  {{- if eq (include "fortiaigate.ingressController" .) "alb" }}
   annotations:
     alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.ingress.healthcheck.llmGateway | quote }}
     alb.ingress.kubernetes.io/success-codes: "200"
+  {{- else }}
+  {{- with include "fortiaigate.traefikBackendAnnotations" . }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
   {{- end }}
   labels:
     app.kubernetes.io/name: fortiaigate

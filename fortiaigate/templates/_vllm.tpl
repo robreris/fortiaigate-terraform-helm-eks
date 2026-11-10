@@ -28,8 +28,8 @@ client resolves the name to pod IPs and dials the port it was given, so
 "port 8000 -> targetPort 8100" would not work and the port on the wire has
 to be the same wherever the container runs. guardrail.yaml renders
 POLICYGUARD_VLLM_URL and the metering endpoint from the two helpers below;
-the loader reads --port for its own health check; the reporter reads
-AIGATE_REPORTER_PORT.
+the loader reads --port (and --ssl-certfile: https) for its own health check;
+the reporter reads AIGATE_REPORTER_PORT.
 */ -}}
 
 {{/*
@@ -40,7 +40,7 @@ chart ships per release and customers must not repoint the engine or model
 version. Only the registry (fortiaigate.image.repository) comes from values.
 */}}
 {{- define "fortiaigate.vllmImage" -}}
-{{ .Values.fortiaigate.image.repository }}/vllm-server:0.28.0-rpt-s1
+{{ .Values.fortiaigate.image.repository }}/vllm-server:0.28.0-1-rpt-s1
 {{- end }}
 
 {{/*
@@ -62,6 +62,53 @@ fortiaigate.vllmModelLoader below both render it. The only other pin is
 {{/* vLLM's GPU licence reporter port (AIGATE_REPORTER_PORT, Service vllm-server-metering). */}}
 {{- define "fortiaigate.vllmReporterPort" -}}
 9110
+{{- end }}
+
+{{/*
+Whether vLLM serves TLS, "true" or empty: with tls.enabled, on the internal
+certificate (fortiaigate-tls-secret, whose SANs carry vllm-server, the name
+policy-guard dials, and 127.0.0.1, where the loader and the reporter poll).
+policy-guard then dials https (guardrail.yaml) and the probes speak HTTPS.
+The image's loader finds --ssl-certfile and polls /health over https,
+accepting exactly that certificate; a loader that predates this polls http,
+never gets its 200 and never releases the decrypted model from memory, so
+this needs vllm-server 0.28.0-1-rpt-s1 or later (fortiaigate.vllmImage), never
+0.28.0-rpt-s1. The build 6207 image supports mutual TLS: vLLM then requires the client's certificate, and
+only that loader, reporter and probe (fortiaigate.vllmProbeHandler) present
+one. The tag was kept for this development build, so a node that holds the
+earlier build must pull it again (fortiaigate.image.pullPolicy Always).
+*/}}
+{{- define "fortiaigate.vllmTls" -}}
+{{- if .Values.tls.enabled -}}true{{- end -}}
+{{- end }}
+
+{{/*
+The handler of vLLM's three probes: its own /health in every mode (the
+READINESS note at fortiaigate.vllmContainer). Under mutual TLS vLLM refuses
+the kubelet's httpGet, which presents no certificate, so the probe execs the
+loader's health subcommand instead: the same GET, from inside the container,
+with vLLM's own certificate pinned and its pair presented as the client
+certificate. It answers within the probes' 5 s timeout. Args: root.
+*/}}
+{{- define "fortiaigate.vllmProbeHandler" -}}
+{{- $root := .root -}}
+{{- $port := include "fortiaigate.vllmHTTPPort" $root -}}
+{{- if include "fortiaigate.internalMtls" $root -}}
+exec:
+  command:
+    - /usr/local/bin/faig-vllm-loader
+    - health
+    - --port={{ $port }}
+    - --ssl-certfile={{ (include "fortiaigate.internalTlsMountPath" $root) }}/tls.crt
+    - --ssl-keyfile={{ (include "fortiaigate.internalTlsMountPath" $root) }}/tls.key
+{{- else -}}
+httpGet:
+  path: /health
+  port: {{ $port }}
+  {{- if include "fortiaigate.vllmTls" $root }}
+  scheme: HTTPS
+  {{- end }}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -194,10 +241,17 @@ gateway into a 503. It ALSO divides the KV pool into a worst-case concurrency
 figure (pool / max-model-len) — but it does NOT size that pool, which comes
 from gpu-memory-utilization alone. Raising it costs no extra memory; it only
 lowers the concurrency vLLM can guarantee if every request were full length.
-UNSET (vllm.maxModelLen empty or 0) omits the flag and vLLM falls back to the
-checkpoint's own max_position_embeddings; vLLM REFUSES TO START when the KV
-pool cannot hold one sequence of that length, so on a GPU that cannot afford
-the whole context this must stay set.
+It is also the policyGuard WINDOW: policy-guard reads it from /v1/models and
+fills what a detector's rules leave of it, so the larger it is, the less a
+long text is split. It re-reads it every minute, so a change reaches the
+windows within a minute of vLLM restarting with it, without restarting
+policy-guard. PER CARD (fortiaigate.gpu.type, files/gpu-profiles.yaml):
+the checkpoint's own maximum, 131072, on the RTX PRO 6000 and B200; less on
+a 24 GB card, whose KV pool beside Triton (~54K tokens) cannot hold one 128K
+request. vllm.maxModelLen set wins; "0" omits the flag and vLLM falls back to
+the checkpoint's own maximum; vLLM REFUSES TO START when the KV pool cannot
+hold one sequence of the length it is given, so a card smaller than the
+profile it is run under needs a smaller value.
 
 First boot pays model load + torch.compile / CUDA-graph capture before
 /health answers (the compile-cache volume only helps from the second boot
@@ -245,6 +299,8 @@ guard is silent in the normal case.
 {{- $tp := int (include "fortiaigate.vllmTensorParallel" .) -}}
 {{- $port := include "fortiaigate.vllmHTTPPort" $root -}}
 {{- $meter := include "fortiaigate.vllmReporterPort" $root -}}
+{{- $tls := eq (include "fortiaigate.vllmTls" $root) "true" -}}
+{{- $mtls := eq (include "fortiaigate.internalMtls" $root) "true" -}}
 - name: vllm
   image: {{ include "fortiaigate.vllmImage" $root }}
   imagePullPolicy: {{ $root.Values.fortiaigate.image.pullPolicy }}
@@ -255,13 +311,34 @@ guard is silent in the normal case.
   args:
     - /opt/faig/models
     - --port={{ $port }}
+    {{- if $tls }}
+    # HTTPS on the internal certificate (fortiaigate.vllmTls)
+    - --ssl-certfile={{ (include "fortiaigate.internalTlsMountPath" $root) }}/tls.crt
+    - --ssl-keyfile={{ (include "fortiaigate.internalTlsMountPath" $root) }}/tls.key
+    {{- end }}
+    {{- if $mtls }}
+    # Mutual TLS (tls.mutual): vLLM also requires the client's certificate
+    # (2 is ssl.CERT_REQUIRED), verified against the internal one. policy-guard,
+    # the loader's health poll, the reporter's /ready and the probes present
+    # the pair.
+    - --ssl-ca-certs={{ include "fortiaigate.internalTlsCAFile" $root }}
+    - --ssl-cert-reqs=2
+    {{- end }}
     - --served-model-name={{ include "fortiaigate.policyGuardModelName" $root }}
     - --gpu-memory-utilization={{ include "fortiaigate.vllmGpuMemoryUtilization" $root }}
     {{- if gt $tp 1 }}
     - --tensor-parallel-size={{ $tp }}
     {{- end }}
-    {{- with ($root.Values.vllm).maxModelLen }}
-    - --max-model-len={{ . }}
+    {{- /* --max-model-len PER CARD: vllm.maxModelLen when set, else the
+           fortiaigate.gpu.type profile's (files/gpu-profiles.yaml: 131072
+           on the RTX PRO 6000 and B200, less on a smaller card). "0" renders no
+           flag, the checkpoint's own maximum. Skipped when vllm.extraArgs
+           already carries the flag, as the knobs below are. */}}
+    {{- if not (include "fortiaigate.vllmExtraArgHas" (dict "root" $root "flag" "--max-model-len")) }}
+    {{- $maxModelLen := include "fortiaigate.gpuParamInt" (dict "root" $root "section" "vllm" "key" "maxModelLen" "explicit" (index ($root.Values.vllm | default dict) "maxModelLen") "what" "vllm.maxModelLen" "min" 0) }}
+    {{- if and $maxModelLen (ne $maxModelLen "0") }}
+    - --max-model-len={{ $maxModelLen }}
+    {{- end }}
     {{- end }}
     {{- /* vllm.logVerbose (values.yaml), Triton's --log-verbose for vLLM.
            0 silences the HTTP access log — one line per request AND per
@@ -344,7 +421,18 @@ guard is silent in the normal case.
   # turning every engine pod NotReady would be a total outage caused by
   # licensing.
   - name: AIGATE_ENGINE_HEALTH
-    value: "http://127.0.0.1:{{ $port }}/health"
+    value: "{{ if $tls }}https{{ else }}http{{ end }}://127.0.0.1:{{ $port }}/health"
+  {{- if $tls }}
+  # The certificate vLLM serves: the only one that check accepts.
+  - name: AIGATE_ENGINE_HEALTH_CERT
+    value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" $root) | quote }}
+  {{- end }}
+  {{- if $mtls }}
+  # Its key: under mutual TLS /ready presents the pair as its client
+  # certificate, which vLLM requires.
+  - name: AIGATE_ENGINE_HEALTH_KEY
+    value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" $root) | quote }}
+  {{- end }}
   {{- if $colocated }}
   # shared (co-located): with no nvidia.com/gpu request the device plugin sets nothing,
   # so the NVIDIA container runtime is told the card here — the one the
@@ -404,24 +492,25 @@ guard is silent in the normal case.
     mountPath: /opt/faig/cache
   - name: vllm-shm
     mountPath: /dev/shm
+  {{- if $tls }}
+  # The internal certificate; the pod defines the volume (vllm-server.yaml,
+  # or triton-server.yaml when co-located, where Triton mounts it too).
+  - name: tls-certs
+    mountPath: {{ (include "fortiaigate.internalTlsMountPath" $root) | quote }}
+    readOnly: true
+  {{- end }}
   startupProbe:
-    httpGet:
-      path: /health
-      port: {{ $port }}
+    {{- include "fortiaigate.vllmProbeHandler" (dict "root" $root) | nindent 4 }}
     periodSeconds: 15
     timeoutSeconds: 5
     failureThreshold: 120
   livenessProbe:
-    httpGet:
-      path: /health
-      port: {{ $port }}
+    {{- include "fortiaigate.vllmProbeHandler" (dict "root" $root) | nindent 4 }}
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 15
   readinessProbe:
-    httpGet:
-      path: /health
-      port: {{ $port }}
+    {{- include "fortiaigate.vllmProbeHandler" (dict "root" $root) | nindent 4 }}
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 15

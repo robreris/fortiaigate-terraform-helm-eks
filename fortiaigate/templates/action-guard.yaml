@@ -1,0 +1,258 @@
+# Action Guard — agent tool-call safety guard, the Go port (action-guard/) of
+# VirtueAI's action-guard (deviations: docs/VirtueAI/action-guard/). :8002.
+#
+# Always deployed. MCP Gateway calls this service for tool-call checks.
+# A call's session history is read from the shared session log (go-common
+# migration 0089) over FAIG_DATABASE_URL, Observability's trace cache
+# (OBSERVABILITY_REDIS_DB on the shared Redis) first. It makes no HTTP call
+# to Observability, so it takes no OBSERVABILITY_URL.
+# Topic Guard runs in-process and scans through the shared guardrail pool.
+# It uses the chart's SHARED PostgreSQL and Redis, with its OWN database and its
+# OWN Redis logical index — which is also VirtueAI's real topology.
+# With tls.enabled it serves HTTPS on the internal certificate, which names it,
+# and under tls.mutual only to the pods that present the internal pair; its
+# callers' ACTION_GUARD_URL is https.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: action-guard
+  labels:
+    app: action-guard
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+    component: action-guard
+    version: v1
+spec:
+  replicas: {{ .Values.actionGuard.replicas }}
+  strategy:
+    type: {{ .Values.fortiaigate.updateStrategy }}
+  selector:
+    matchLabels:
+      app: action-guard
+      component: action-guard
+  template:
+    metadata:
+      annotations:
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+        {{- end }}
+      labels:
+        app: action-guard
+        component: action-guard
+        version: v1
+    spec:
+      # NO nodeAffinity — see the comment in logd.yaml/api.yaml: a licence covers
+      # the deployment and names no machine, so there is nothing to pin to.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: action-guard
+        image: {{ .Values.fortiaigate.image.repository }}/action-guard:{{ .Values.fortiaigate.image.tag }}
+        imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - containerPort: 8002
+          name: http
+          protocol: TCP
+        # /healthz is a static handler (internal/httpapi/misc.go): it does NOT
+        # touch the database, so it reports "process is up", not "usable". It
+        # needs no client certificate under tls.mutual.
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+            {{- if .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+            {{- if .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          failureThreshold: 3
+        resources:
+          {{- toYaml .Values.actionGuard.resources | nindent 10 }}
+        env:
+        {{- if .Values.tls.enabled }}
+        - name: FAIG_INTERNAL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        - name: FAIG_INTERNAL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
+        {{- end }}
+        - name: FAIG_MCP_ADMISSION_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "fortiaigate.internalTokenSecretName" . }}
+              key: internal-token
+        - name: LOG_LEVEL
+          value: {{ .Values.fortiaigate.env.logLevel | quote }}
+        # ---- shared PostgreSQL ------------------------------------------------
+        # action-guard has no database of its own any more: its evaluation and
+        # Topic Guard query logs are in FortiAIGate's (go-common migration
+        # 0087, which api applies), reached through FAIG_DATABASE_URL below,
+        # in which the kubelet expands $(POSTGRES_PASSWORD).
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-postgresql
+              key: password
+        # ---- shared Redis, action-guard's own logical database --------------
+        # rediss:// when redis.tls.enabled (the chart default): Bitnami serves
+        # TLS on the same port, on the internal certificate, which this client
+        # verifies, presenting the internal pair, which redis.tls.authClients
+        # requires (fortiaigate.companionRedisURL). It carries the event bus:
+        # pending human approvals, the tenant SSE stream and Topic Guard's rate
+        # limits.
+        # REDIS_CLUSTER MUST be false — src/config.py defaults it TRUE, and
+        # src/app.py would then open a RedisCluster client against this chart's
+        # standalone Redis and fail at startup.
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-redis
+              key: redis-password
+        # Redis database 2: 0 is every other service's, 3 observability's.
+        - name: REDIS_URL
+          value: {{ include "fortiaigate.companionRedisURL" (dict "root" . "db" 2) | quote }}
+        - name: REDIS_CLUSTER
+          value: "false"
+        # Pending human approvals and the tenant SSE stream. The binary
+        # defaults it off, where the approval APIs and evaluations answer 503;
+        # on unless actionGuard.env sets it.
+        {{- if not (hasKey (.Values.actionGuard.env | default dict) "EVENT_BUS_ENABLED") }}
+        - name: EVENT_BUS_ENABLED
+          value: "true"
+        {{- end }}
+        # ---- FortiAIGate's database: keys, configuration, logs ---------------
+        # Callers authenticate with a FortiAIGate virtual key, read here (public
+        # schema) as mcp-gateway checks them (go-common/vkauth); the compiled
+        # guardrail configuration is read here too, and the two logs are
+        # written here (go-common/db/store) for api to read. ?ssl= follows
+        # postgresql.tls.enabled: require (encrypt, the self-signed certificate
+        # unverified) or disable. The keys' L2 cache and vk_invalidate are on
+        # the shared Redis's database 0 (go-common/redis, REDIS_HOST + REDIS_DB
+        # unset), NOT the REDIS_URL database above.
+        - name: FAIG_DATABASE_URL
+          value: "postgresql://{{ .Values.postgresql.auth.username }}:$(POSTGRES_PASSWORD)@{{ .Release.Name }}-postgresql:{{ .Values.postgresql.primary.service.port }}/{{ .Values.postgresql.auth.database }}?ssl={{ ternary "verify-full" "disable" .Values.postgresql.tls.enabled }}{{ if .Values.postgresql.tls.enabled }}&sslrootcert={{ include "fortiaigate.internalTlsCAFile" . }}&sslcert={{ (include "fortiaigate.internalTlsMountPath" .) }}/tls.crt&sslkey={{ (include "fortiaigate.internalTlsMountPath" .) }}/tls.key{{ end }}"
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_HOST
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_PORT
+        - name: REDIS_SSL_VERIFY
+          value: "true"
+        - name: REDIS_SSL_ENABLED
+          value: {{ .Values.redis.tls.enabled | quote }}
+        {{- if .Values.redis.tls.enabled }}
+        - name: REDIS_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- end }}
+        # ---- Topic Guard: the in-cluster guardrail pool --------------------
+        # FAIG_GUARDRAIL_ADDR defaults to guardrail:50051 ("off" fails every
+        # evaluation). Dialed with TLS when FAIG_INTERNAL_TLS_CA_FILE (above)
+        # names the internal certificate, verified and, under tls.mutual,
+        # presenting the internal pair, as llm-gateway dials it.
+        # ---- its own API: HTTPS on the internal certificate ----------------
+        # Under tls.mutual only to the pods that present the internal pair;
+        # /healthz stays open for the probes.
+        {{- if .Values.tls.enabled }}
+        - name: FORTIAIGATE_SSL_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FORTIAIGATE_SSL_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        - name: FAIG_INTERNAL_TLS_CLIENT_AUTH
+          value: "require"
+        {{- end }}
+        {{- end }}
+        # ---- session history: Observability's trace cache ------------------
+        # The database observability's REDIS_URL names (/3), on the shared
+        # Redis above (go-common/obssession).
+        - name: OBSERVABILITY_REDIS_DB
+          value: "3"
+        # ---- the rest, verbatim from values ---------------------------------
+        {{- range $k, $v := .Values.actionGuard.env }}
+        - name: {{ $k }}
+          value: {{ $v | quote }}
+        {{- end }}
+        volumeMounts:
+        # Writable scratch for WeasyPrint / matplotlib / fontconfig caches —
+        # MPLCONFIGDIR and XDG_CACHE_HOME point here in the image.
+        - name: tmp
+          mountPath: /tmp
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        - name: tls-certs
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
+          readOnly: true
+        {{- end }}
+      volumes:
+      # Deliberately NOT mounting the shared-data PVC that api/logd use:
+      # action-guard writes nothing to /etc/fortiaigate.
+      - name: tmp
+        emptyDir: {}
+      {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+      - name: tls-certs
+        secret:
+          secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
+      {{- end }}
+      {{- with .Values.fortiaigate.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: action-guard
+  labels:
+    app: action-guard
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    component: action-guard
+spec:
+  # ClusterIP only: mcp-gateway, plugin-adapter and inference-hooks call it
+  # in-cluster, and it is NOT on the ingress (templates/ingress.yaml routes
+  # only /api/, /ui, /ai, /). Note /swagger and /internal/metrics are served
+  # without a virtual key on this port: under tls.mutual only to the pods that
+  # present the internal pair, else contained by it not being reachable from
+  # outside the cluster. The port keeps the name http with tls.enabled.
+  type: ClusterIP
+  selector:
+    app: action-guard
+    component: action-guard
+  ports:
+  - name: http
+    port: 8002
+    targetPort: http
+    protocol: TCP

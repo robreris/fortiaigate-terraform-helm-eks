@@ -1,0 +1,64 @@
+{{- if and .Values.auth.enabled .Values.auth.autoProvision }}
+{{- $name := include "fortiaigate.authIdentityName" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+rules:
+- apiGroups: [""]
+  resources: [secrets]
+  resourceNames: [{{ $name | quote }}]
+  verbs: [get]
+# Kubernetes cannot restrict create by resourceNames. This grant is scoped to
+# this namespace and the short-lived identity Job's ServiceAccount only.
+- apiGroups: [""]
+  resources: [secrets]
+  verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+subjects:
+- kind: ServiceAccount
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: {{ $name }}}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-%s" ($name | trunc 54 | trimSuffix "-") (printf "%s/%s:%s" .Values.fortiaigate.image.repository .Values.auth.image .Values.fortiaigate.image.tag | sha256sum | trunc 8) }}
+spec:
+  backoffLimit: 4
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels: {app: auth-identity}
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: {{ $name }}
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
+      {{- with .Values.fortiaigate.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: provision
+        image: {{ .Values.fortiaigate.image.repository }}/{{ .Values.auth.image }}:{{ .Values.fortiaigate.image.tag }}
+        imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
+        command: [/home/appuser/auth, provision-kubernetes]
+        securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {cpu: 1000m, memory: 256Mi}
+        env:
+        - name: POD_NAMESPACE
+          valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+        - {name: FAIG_AUTH_IDENTITY_SECRET, value: {{ $name | quote }}}
+{{- end }}

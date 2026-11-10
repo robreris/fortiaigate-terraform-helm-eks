@@ -5,6 +5,17 @@
    Release: {{ .Release.Name }}
    Chart Version: {{ .Chart.Version }}
    App Version: {{ .Chart.AppVersion }}
+{{- if and (not .Values.tls.internalExistingSecret) (or .Values.tls.enabled .Values.postgresql.tls.enabled .Values.redis.tls.enabled) }}
+{{- $internalTls := include "fortiaigate.internalTls" . | fromJson }}
+
+🔒 Internal TLS certificate (Secret fortiaigate-tls-secret) expires {{ $internalTls.notAfter | trunc 10 }}.
+{{- if and $internalTls.renew .Release.IsUpgrade }}
+   This upgrade generated a new one, so every pod that uses it restarts,
+   PostgreSQL and Redis included: LLM traffic and the console are
+   interrupted for about a minute while they do.
+{{- end }}
+   An upgrade renews it once it expires in fewer than 5 years.
+{{- end }}
 
 🛠️  Useful Commands:
 
@@ -18,20 +29,44 @@
    $ kubectl logs -n {{ .Release.Namespace }} -l app=llm-gateway -f
 
    Scanner Logs (by type):
-   $ kubectl logs -n {{ .Release.Namespace }} -l app=guardrail -f
+{{- range list "guardrail" "dlp-scanner" "policy-guard" }}
+   $ kubectl logs -n {{ $.Release.Namespace }} -l app=guardrail,guardrail-component={{ . }} -f
+{{- end }}
 
    Updates:
-   $ helm upgrade {{ .Release.Name }} ./fortiaigate-chart
-   $ helm rollback {{ .Release.Name }} <revision>
+   $ helm upgrade {{ .Release.Name }} ./fortiaigate-chart -n {{ .Release.Namespace }} -f values.yaml
+   $ helm rollback {{ .Release.Name }} <revision> -n {{ .Release.Namespace }}
 
    Cleanup:
-   $ helm uninstall {{ .Release.Name }}
+   $ helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+🛡️  Guardrail scan cap: {{ .Values.guardrail.env.maxScanTokens | default "8192" }} o200k_base tokens per block (guardrail.env.maxScanTokens)
+{{- if hasKey (.Values.guardrail.env | default dict) "maxScanChars" }}
+   ⚠️  guardrail.env.maxScanChars is retired and ignored: the cap is guardrail.env.maxScanTokens,
+      in tokens (an English token is about 4 characters).
+{{- end }}
+{{- $paInStream := dig "env" "inStream" (dict) (.Values.pluginAdapter | default dict) }}
+{{- if or (index $paInStream "chunkBytes") (index $paInStream "overlapBytes") }}
+   ⚠️  pluginAdapter.env.inStream.chunkBytes / overlapBytes are retired and ignored: the window is
+      pluginAdapter.env.inStream.windowChars / holdbackChars, in characters (1024 / 256 by default).
+{{- end }}
+{{- $gwInStream := dig "env" "inStream" (dict) (.Values.llmGateway | default dict) }}
+{{- if or (index $gwInStream "chunkChars") (index $gwInStream "overlapChars") }}
+   ⚠️  llmGateway.env.inStream.chunkChars / overlapChars are ignored: renamed
+      llmGateway.env.inStream.windowChars / holdbackChars on 2026-11-05.
+{{- end }}
+{{- $fabInStream := dig "inStream" (dict) (.Values.fabric | default dict) }}
+{{- if or (index $fabInStream "chunkChars") (index $fabInStream "overlapChars") }}
+   ⚠️  fabric.inStream.chunkChars / overlapChars are ignored: renamed
+      fabric.inStream.windowChars / holdbackChars on 2026-11-05.
+{{- end }}
 
 💻 Resource Usage:
 {{- if (.Values.fortiaigate.gpu).enabled }}
    💡 GPU Resources: Enabled - Scanners will use GPU acceleration
 {{- else }}
-   💡 GPU Resources: Disabled - GPU inference is unavailable; POLICY detectors fail closed
+   💡 GPU Resources: Disabled - no Triton or vLLM inference is started.
+   DLP and POLICY inference are unavailable. Check license coverage before scan acceptance.
 {{- end }}
 {{- if include "fortiaigate.vllmEnabled" . }}
 {{- $plan := include "fortiaigate.vllmGpuPlan" . | fromJson }}
@@ -105,12 +140,13 @@
    {{ include "fortiaigate.gpuParamLine" (dict "root" . "label" "triton.dlpMaxBatchSize" "section" "triton" "key" "dlpMaxBatchSize" "explicit" (index $tritonV "dlpMaxBatchSize")) }}
    {{ include "fortiaigate.gpuParamLine" (dict "root" . "label" "triton.resources.limits.cpu" "section" "triton" "key" "cpuLimit" "explicit" (dig "resources" "limits" "cpu" "" $tritonV)) }}
 {{- if include "fortiaigate.vllmEnabled" . }}
+   {{ include "fortiaigate.gpuParamLine" (dict "root" . "label" "vllm.maxModelLen" "section" "vllm" "key" "maxModelLen" "explicit" (index $vllmV "maxModelLen")) }}{{ if eq (include "fortiaigate.gpuParam" (dict "root" . "section" "vllm" "key" "maxModelLen" "explicit" (index $vllmV "maxModelLen") "what" "vllm.maxModelLen")) "0" }} (no --max-model-len: the checkpoint's own maximum){{ end }}
    {{ include "fortiaigate.gpuParamLine" (dict "root" . "label" "vllm.maxNumSeqs" "section" "vllm" "key" "maxNumSeqs" "explicit" (index $vllmV "maxNumSeqs")) }}
    {{ include "fortiaigate.gpuParamLine" (dict "root" . "label" "vllm.apiServerCount" "section" "vllm" "key" "apiServerCount" "explicit" (index $vllmV "apiServerCount")) }}
    {{ include "fortiaigate.gpuParamLine" (dict "root" . "label" "vllm.blockSize" "section" "vllm" "key" "blockSize" "explicit" (index $vllmV "blockSize")) }}
    {{ include "fortiaigate.gpuParamLine" (dict "root" . "label" "vllm.resources.limits.cpu" "section" "vllm" "key" "cpuLimit" "explicit" (dig "resources" "limits" "cpu" "" $vllmV)) }}
    {{ include "fortiaigate.gpuParamLine" (dict "root" . "label" "vllm.resources.requests.cpu" "section" "vllm" "key" "cpuRequest" "explicit" (dig "resources" "requests" "cpu" "" $vllmV)) }}
-{{- range $f := list "--max-num-seqs" "--api-server-count" "--block-size" "--gpu-memory-utilization" }}
+{{- range $f := list "--max-model-len" "--max-num-seqs" "--api-server-count" "--block-size" "--gpu-memory-utilization" }}
 {{- if include "fortiaigate.vllmExtraArgHas" (dict "root" $ "flag" $f) }}
    vllm.extraArgs sets {{ $f }}, so that line above is not applied: the flag in extraArgs is what vLLM gets.
 {{- end }}
@@ -147,7 +183,94 @@
 
    View resource consumption:
    $ kubectl top pods -n {{ .Release.Namespace }}
+{{- if (.Values.fabric).enabled }}
+{{- $fsvc := .Values.fabric.service | default dict }}
+{{- $ftype := $fsvc.type | default "NodePort" }}
+{{- $fport := int ($fsvc.port | default 8443) }}
+
+🔗 FortiGate integration (fabric), Service fabric ({{ $ftype }}):
+{{- range $fsvc.externalIPs }}
+   Point FortiGates at https://{{ . }}:{{ $fport }}
+{{- end }}
+{{- if eq $ftype "NodePort" }}
+{{- if $fsvc.nodePort }}
+   Point FortiGates at https://<any node IP>:{{ $fsvc.nodePort }}
+{{- else }}
+   Point FortiGates at https://<any node IP>:<nodePort>. The nodePort was auto-assigned; pin it
+   (fabric.service.nodePort) before you configure a FortiGate. Read it with:
+   $ kubectl get svc fabric -n {{ .Release.Namespace }} -o jsonpath='{.spec.ports[0].nodePort}{"\n"}'
+{{- end }}
+{{- else if eq $ftype "LoadBalancer" }}
+   Point FortiGates at https://<EXTERNAL-IP>:{{ $fport }}. Read the address with:
+   $ kubectl get svc fabric -n {{ .Release.Namespace }}
+{{- else if not $fsvc.externalIPs }}
+   ClusterIP has no outside path of its own. Pass TCP {{ $fport }} through your ingress controller, e.g.:
+   $ helm upgrade ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx --reuse-values \
+       --set tcp.{{ $fport }}={{ .Release.Namespace }}/fabric:{{ $fport }}
+   and point FortiGates at https://<ingress IP>:{{ $fport }}
+{{- end }}
+   The pod is Ready once the WebUI first-run setup has created the organization. FortiGates are
+   served once a licence is installed, and each one only after an admin authorizes it on
+   Fabric Connectors -> Device and assigns its guardrails.
+   A FortiGate authenticates with its Fortinet-issued client certificate (mutual TLS); nothing else is accepted.
+   $ kubectl logs -n {{ .Release.Namespace }} -l app=fabric -f
+{{- end }}
 
 🚀 Get started by pointing your AI applications to FortiAIGate, AI-powered scanning of all prompts and responses!
 
 Protect your AI - Happy scanning! 🛡️
+
+Claude Code plugin adapter:
+{{- if eq (toString .Values.pluginAdapter.legacyDevAuth) "true" }}
+  Development mode (pluginAdapter.legacyDevAuth): the plugin's base is {{ if .Values.ingress.host }}https://{{ .Values.ingress.host }}/plugin/claude/v1{{ else }}https://<this host>/plugin/claude/v1{{ end }}
+  Each scan needs a virtual key (X-FAIG-Virtual-Key), judged by its policies as on the LLM gateway.
+{{- else }}
+  Managed mode: private, reached only by plugin-adapter-mcp; the guardrails of the Agent Policies judge each scan.
+{{- end }}
+  $ kubectl logs -n {{ .Release.Namespace }} -l app=plugin-adapter -c plugin-adapter -f
+
+Claude Code plugin MCP endpoint:
+  Add the claude.ai Connector named exactly FortiAIGate AgentGuard, URL {{ if .Values.ingress.host }}https://{{ .Values.ingress.host }}/api/v1/plugins/claude-code/mcp{{ else }}https://<this host>/api/v1/plugins/claude-code/mcp{{ end }}.
+{{- if eq (toString (.Values.pluginAdapter).legacyDevAuth) "true" }}
+  It authenticates nobody: the caller's virtual key goes to the development-mode adapter.
+{{- else }}
+  Its authorization server is {{ if .Values.ingress.host }}https://{{ .Values.ingress.host }}/oauth{{ else }}https://<this host>/oauth{{ end }}; the Client ID is on the Plugins card.
+{{- end }}
+  $ kubectl logs -n {{ .Release.Namespace }} -l app=plugin-adapter -c plugin-adapter-mcp -f
+
+{{- if (.Values.inferenceHooks).enabled }}
+{{- $ihIng := .Values.inferenceHooks.ingress | default dict }}
+{{- $ihHost := .Values.ingress.host }}
+
+Claude inference hooks (inferenceHooks.enabled, {{ .Values.inferenceHooks.replicas }} replica(s)):
+  Hook URL: https://{{ $ihHost | default "<this host>" }}/inference-hooks/claude/v1/<endpoint id>
+  The card is inferenceHooks.card: enter endpointId in the URL above, and its requestHeader in claude.ai; signingSecret is claude.ai's.
+  PREREQUISITE: Anthropic checks the certificate of {{ $ihHost | default "that host" }} against the PUBLIC CA trust store, and calls a public host name with an IPv4 address on port 443. A self-signed certificate fails Test connection.
+{{- if .Values.tls.enabled }}
+  Certificate: the platform's (tls.cert / tls.key, Secret fortiaigate-external-tls-secret; ACM on an ALB), shared with the console and the API; it must be from a public CA.
+{{- else }}
+  tls.enabled=false: the ingress serves no certificate for the hook route, and Anthropic calls HTTPS only. End the TLS in front of the ingress with a public CA's certificate.
+{{- end }}
+{{- $ihRanges := compact ($ihIng.sourceRanges | default list) }}
+{{- if $ihRanges }}
+  Only {{ join ", " $ihRanges }} can reach the hook route (inferenceHooks.ingress.sourceRanges); the ingress answers other addresses 403. The ingress controller must see the client's real address.
+{{- else }}
+  Any address can reach the hook route (inferenceHooks.ingress.sourceRanges is empty). Each frame is still checked by its signature. Recommended: set it to Anthropic's 160.79.106.0/24, after you make sure that the ingress controller sees the clients' original source address.
+{{- end }}
+  $ kubectl logs -n {{ .Release.Namespace }} -l app=inference-hooks -f
+{{- end }}
+{{- if .Values.auth.enabled }}
+Auth core starts automatically. Complete normal GUI setup once.
+The organization and public URL come from the confirmed setup record.
+LLM virtual-key accounting is initialized in the setup transaction.
+No second Helm deployment or Models Client Access call is required.
+The workload listener auth:9000 is private and requires mTLS.
+{{- if .Values.auth.autoProvision }}
+Internal identity Secret: {{ include "fortiaigate.authIdentityName" . }}.
+{{- end }}
+Preserve the Auth identity Secret, configured overrides and database in recovery backups.
+{{- else }}
+Auth core is disabled by an explicit deployment override.
+The supported fresh-install default is auth.enabled=true.
+LLM RBAC accounting requires the internal Auth service.
+{{- end }}

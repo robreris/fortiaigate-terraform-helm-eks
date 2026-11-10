@@ -1,0 +1,58 @@
+{{- /*
+The plugin adapter's MCP endpoint: the endpoint the Claude Code plugin
+(AgentGuard) reaches FortiAIGate through, as the claude.ai Connector
+FortiAIGate AgentGuard at https://<host>/api/v1/plugins/claude-code/mcp, and forwards
+each scan to plugin-adapter. With a managed adapter it
+has plugin-adapter check each request and forwards the caller's credential as
+it came: the adapter authenticates the employee (OAuth through Auth, or their
+key, by the MCP inbound policy) with the card's workload certificate
+(pluginAdapterMcp.workloadTlsSecretName); with
+pluginAdapter.legacyDevAuth it passes the caller's credentials through.
+
+Always deployed, as a second container of plugin-adapter's pod
+(plugin-adapter.yaml), so it has plugin-adapter's replicas; this file checks
+the values and gives it its own Service.
+*/ -}}
+{{- $gs := .Values.pluginAdapterMcp }}
+{{- /* plugin-adapter-mcp takes a body of 16 MiB at most (its config.MaxBody),
+above plugin-adapter's own body limit, the guardrail's scan limit in base64
+and 64 KiB, so a scan past the limits gets the adapter's 413, which the plugin
+reads. A scan limit past 12533760 bytes would put the adapter's limit above
+it, and plugin-adapter-mcp would refuse those scans first, with an HTTP 413
+the plugin cannot read. */ -}}
+{{- $scan := int64 (((.Values.guardrail).env).maxRequestBytes | default "10485760") }}
+{{- if le $scan 0 }}{{- $scan = 10485760 }}{{- end }}
+{{- if gt (add (mul (div (add $scan 2) 3) 4) 65536) 16777216 }}
+{{- fail (printf "guardrail.env.maxRequestBytes=%d: with pluginAdapterMcp, at most 12533760 (plugin-adapter's body limit, the scan in base64 and 64 KiB, must stay within plugin-adapter-mcp's 16 MiB)" $scan) }}
+{{- end }}
+{{- $managed := ne (toString (.Values.pluginAdapter).legacyDevAuth) "true" }}
+{{- if and $managed (not $.Values.auth.enabled) (not $gs.workloadTlsSecretName) }}
+{{- fail "managed AgentGuard requires pluginAdapterMcp.workloadTlsSecretName: the Auth workload certificate plugin-adapter resolves employee tokens with" }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: plugin-adapter-mcp
+  {{- if eq (include "fortiaigate.ingressController" .) "alb" }}
+  annotations:
+    alb.ingress.kubernetes.io/healthcheck-path: "/api/v1/plugins/health/readiness"
+    alb.ingress.kubernetes.io/success-codes: "200"
+  {{- else }}
+  {{- with include "fortiaigate.traefikBackendAnnotations" . }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  labels:
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+spec:
+  selector:
+    app: plugin-adapter
+  ports:
+  - protocol: TCP
+    port: 8767
+    targetPort: 8767
+    name: http
+  type: ClusterIP

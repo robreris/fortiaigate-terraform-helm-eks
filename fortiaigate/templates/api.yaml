@@ -10,8 +10,6 @@ metadata:
     app.kubernetes.io/managed-by: helm
     component: api
     version: v1
-  annotations:
-    deployment.kubernetes.io/revision: "1"
 spec:
   replicas: {{ .Values.api.replicas }}
   strategy:
@@ -23,10 +21,12 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+        # Restart the pod when a TLS certificate changes: the external one it
+        # serves, or the chart-generated internal one it trusts as a client
         checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
-        # This is the key that triggers a restart when TLS certificates change
-        checksum/config: {{ printf "%s%s" (tpl (.Files.Get .Values.tls.cert) $) (tpl (.Files.Get .Values.tls.key) $) | sha256sum }}
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+        {{- end }}
       labels:
         app: api
         component: api
@@ -59,10 +59,29 @@ spec:
         - containerPort: 8000
           name: http
           protocol: TCP
+        # api listens only once its database setup succeeds (api/cmd/api/main.go),
+        # and /api/healthz answers 200 whenever it listens, outside the login and
+        # licence checks. So a rollout keeps the old pod in the Service until the
+        # new one serves; without this the new pod counted as ready on start and
+        # the Ingress answered 502 until it listened. No livenessProbe: api waits
+        # for PostgreSQL at start, and a kill during that wait only restarts it.
+        readinessProbe:
+          httpGet:
+            path: /api/healthz
+            port: http
+            {{- if .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          initialDelaySeconds: 3
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
         resources:
           {{- toYaml .Values.api.resources | nindent 10 }}
         # Environment variables
         env:
+        # Keep provider health probes consistent with the LLM gateway.
+        - {name: UPSTREAM_TLS_VERIFY, value: {{ .Values.llmGateway.env.upstreamTls.verify | quote }}}
         - name: FORTIAIGATE_LOG_LEVEL
           value: {{ .Values.fortiaigate.env.logLevel | quote }}
         # Failure-policy pins (fortiaigate.failurePolicy.*, #91): rendered only
@@ -91,15 +110,29 @@ spec:
         - name: FORTIAIGATE_EXTERNAL_URL
           value: {{ $ssoExternal | quote }}
         {{- end }}
+        {{- if .Values.auth.enabled }}
+        - name: FAIG_AUTH_URL
+          value: https://auth:9000
+        - name: FAIG_AUTH_WORKLOAD_CERT_FILE
+          value: /var/run/faig-auth/tls.crt
+        - name: FAIG_AUTH_WORKLOAD_KEY_FILE
+          value: /var/run/faig-auth/tls.key
+        - name: FAIG_AUTH_SERVER_CA_FILE
+          value: /var/run/faig-auth/ca.crt
+        # Bind protected MCP profiles to the deployed gateway certificate,
+        # including a supported custom workload Secret/identity pair.
+        - name: FAIG_MCP_AUTH_WORKLOAD_URIS
+          value: {{ list .Values.auth.mcpWorkloadIdentity | toJson | quote }}
+        {{- end }}
         - name: CSRF_SECRET_KEY
+          {{- if .Values.fortiaigate.env.csrfSecretKey }}
+          value: {{ .Values.fortiaigate.env.csrfSecretKey | quote }}
+          {{- else }}
           valueFrom:
-            {{- if .Values.fortiaigate.env.csrfSecretKey }}
-            value: {{ .Values.fortiaigate.env.csrfSecretKey | quote }}
-            {{- else }}
             secretKeyRef:
               name: {{ include "fortiaigate.fullname" . }}-csrf
               key: csrf-secret-key
-            {{- end }}
+          {{- end }}
         # Master key sealing credential secrets at rest (go-common/secret).
         # Name resolution (explicit override, else chart-generated) lives in
         # fortiaigate.masterKeySecretName so api/llm-gateway/guardrail always
@@ -113,31 +146,53 @@ spec:
               name: {{ include "fortiaigate.masterKeySecretName" . }}
               key: master-key
         {{- if .Values.tls.enabled }}
+        # The external certificate: what clients reach through the Ingress
         - name: FORTIAIGATE_SSL_CERT_FILE
-          value: {{ printf "%s/tls.crt" .Values.tls.mountPath | quote }}
+          value: "/etc/tls-external/tls.crt"
         - name: FORTIAIGATE_SSL_KEY_FILE
-          value: {{ printf "%s/tls.key" .Values.tls.mountPath | quote }}
+          value: "/etc/tls-external/tls.key"
+        # The internal certificate, which the guardrail pool and the licence
+        # manager serve: the CA this pod verifies them against
+        - name: FAIG_INTERNAL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        # Mutual TLS (tls.mutual): the client certificate this pod presents to
+        # the servers that require one, the internal pair itself
+        - name: FAIG_INTERNAL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
         {{- end }}
         - name: REDIS_SSL_ENABLED
           value: {{ .Values.redis.tls.enabled | quote }}
         {{- if .Values.redis.tls.enabled }}
         - name: REDIS_SSL_CERTFILE
-          value: {{ printf "%s/tls.crt" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: REDIS_SSL_KEYFILE
-          value: {{ printf "%s/tls.key" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: REDIS_SSL_CA_CERTS
-          value: {{ printf "%s/%s" (include "fortiaigate.dbTlsMountPath" .) (include "fortiaigate.dbTlsCAFile" .) | quote }}
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: REDIS_SSL_VERIFY
+          value: "true"
         {{- end }}
         - name: POSTGRES_SSL_ENABLED
           value: {{ .Values.postgresql.tls.enabled | quote }}
         {{- if .Values.postgresql.tls.enabled }}
         - name: POSTGRES_SSL_CERTFILE
-          value: {{ printf "%s/tls.crt" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: POSTGRES_SSL_KEYFILE
-          value: {{ printf "%s/tls.key" (include "fortiaigate.dbTlsMountPath" .) | quote }}
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: POSTGRES_SSL_CA_CERTS
-          value: {{ printf "%s/%s" (include "fortiaigate.dbTlsMountPath" .) (include "fortiaigate.dbTlsCAFile" .) | quote }}
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: POSTGRES_SSL_VERIFY
+          value: "true"
         {{- end }}
+        # Observability's trace cache (its REDIS_URL's database, /3): the
+        # Trajectories session detail reads a session's trace there first
+        # (go-common/obssession), on the Redis below.
+        - name: OBSERVABILITY_REDIS_DB
+          value: "3"
         # Database configuration (only what's actually used by the application)
         - name: REDIS_HOST
           valueFrom:
@@ -175,6 +230,11 @@ spec:
             drop:
               - ALL
         volumeMounts:
+        {{- if .Values.auth.enabled }}
+        - name: auth-workload
+          mountPath: /var/run/faig-auth
+          readOnly: true
+        {{- end }}
         - name: shared-data
           mountPath: /etc/fortiaigate/
           readOnly: false
@@ -182,11 +242,22 @@ spec:
           mountPath: /tmp
         {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
         - name: tls-certs
-          mountPath: {{ .Values.tls.mountPath | quote }}
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
           readOnly: true
         {{- end }}
-      {{- include "fortiaigate.dbTlsVolumeMount" . | nindent 8 }}
+        {{- if .Values.tls.enabled }}
+        - name: external-tls-certs
+          mountPath: /etc/tls-external
+          readOnly: true
+        {{- end }}
       volumes:
+      {{- if .Values.auth.enabled }}
+      - name: auth-workload
+        secret:
+          secretName: {{ include "fortiaigate.authSecret" (dict "root" . "override" .Values.auth.apiWorkloadSecretName) | quote }}
+          {{- include "fortiaigate.authSecretItems" (dict "component" "api" "override" .Values.auth.apiWorkloadSecretName) | nindent 10 }}
+          defaultMode: 0440
+      {{- end }}
       - name: shared-data
         persistentVolumeClaim:
           claimName: {{ include "fortiaigate.fullname" . }}-storage
@@ -195,9 +266,13 @@ spec:
       {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
       - name: tls-certs
         secret:
+          secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
+      {{- end }}
+      {{- if .Values.tls.enabled }}
+      - name: external-tls-certs
+        secret:
           secretName: {{ include "fortiaigate.tlsSecretName" . }}
       {{- end }}
-      {{- include "fortiaigate.dbTlsVolume" . | nindent 6 }}
       {{- with .Values.fortiaigate.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -207,10 +282,15 @@ apiVersion: v1
 kind: Service
 metadata:
   name: api
-  {{- if eq .Values.ingress.className "alb" }}
+  {{- if eq (include "fortiaigate.ingressController" .) "alb" }}
   annotations:
     alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.ingress.healthcheck.api | quote }}
     alb.ingress.kubernetes.io/success-codes: "200"
+  {{- else }}
+  {{- with include "fortiaigate.traefikBackendAnnotations" . }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
   {{- end }}
   labels:
     app: api

@@ -1,0 +1,539 @@
+{{- /*
+The private AgentGuard adapter authenticates the employee itself, from the
+credential plugin-adapter-mcp forwards as it came (an OAuth token Auth
+resolves, or a USER key), and the key's policies judge each prompt, tool event
+and answer. Managed, the scans are served on the pod's loopback only; the
+HTTPS port serves the probes. No /plugin ingress is created for normal
+runtime. The direct virtual-key path requires
+pluginAdapter.legacyDevAuth=true. Both plugin containers are always deployed.
+
+plugin-adapter-mcp runs as a second container of this pod (its Service is in
+plugin-adapter-mcp.yaml) and reaches the adapter on a second, plain listener
+bound to the pod's loopback (127.0.0.1:8766), so that hop never leaves the pod.
+The adapter's own HTTPS listener, Service and certificate stay for the probes,
+and in development mode for the /plugin route.
+
+Two certificates, as api and llm-gateway have (tls.enabled): the pod's own
+listeners serve the EXTERNAL one (fortiaigate-external-tls-secret, the chart's
+tls.cert, mounted at /etc/tls-external) — plugin-adapter-mcp's, which the
+ingress routes /api/v1/plugins/claude-code to, and the adapter's — and every
+hop the pod dials inside the deployment trusts the INTERNAL one
+(fortiaigate-tls-secret at tls.mountPath): the guardrail pool, the licence
+manager, PostgreSQL and Redis, presenting the internal pair as its client
+certificate under tls.mutual. The adapter dials the guardrail as fabric does
+(FAIG_GUARDRAIL_TLS=verify, FAIG_GUARDRAIL_TLS_CA_FILE, and under tls.mutual
+FAIG_GUARDRAIL_TLS_CERT_FILE/KEY_FILE); its licence client reads
+FAIG_INTERNAL_TLS_*. Auth is a third trust, its own PKI: the workload
+certificate below.
+
+The adapter's listener serves pluginAdapter.managedAuth.tlsSecretName when one
+is set; else the external certificate with tls.enabled; else, managed, the
+adapter certificate Auth issues (fortiaigate.authSecret).
+*/ -}}
+{{- $pa := .Values.pluginAdapter }}
+{{- $legacy := eq (toString $pa.legacyDevAuth) "true" }}
+{{- $managed := not $legacy }}
+{{- $gs := .Values.pluginAdapterMcp }}
+{{- /* The adapter serves the AgentGuard certificate (an explicit secret, or
+the one Auth issues) only where the external one does not apply. */ -}}
+{{- $agTls := and $managed (or (($pa.managedAuth).tlsSecretName) (not .Values.tls.enabled)) }}
+{{- if not $legacy }}
+{{- if and (not $.Values.auth.enabled) (not (($pa.managedAuth).organizationId)) }}
+{{- fail "pluginAdapter.managedAuth.organizationId is required for managed AgentGuard" }}
+{{- end }}
+{{- if and (not $.Values.auth.enabled) (not (($pa.managedAuth).tlsSecretName)) (not .Values.tls.enabled) }}
+{{- fail "pluginAdapter.managedAuth.tlsSecretName is required for managed AgentGuard HTTPS when tls.enabled is false" }}
+{{- end }}
+{{- if and (not $.Values.auth.enabled) (not (hasPrefix "https://" (toString (.Values.mcpGateway.env).FAIG_AUTH_URL))) }}
+{{- fail "managed AgentGuard requires an HTTPS mcpGateway.env.FAIG_AUTH_URL" }}
+{{- end }}
+{{- range $key := list "FAIG_SETUP_ORGANIZATION" "MCP_GATEWAY_ORGANIZATION_ID" "FAIG_AUTH_WORKLOAD_CERT_FILE" "FAIG_AUTH_WORKLOAD_KEY_FILE" "FAIG_AUTH_SERVER_CA_FILE" }}
+{{- if hasKey $.Values.mcpGateway.env $key }}
+{{- fail (printf "%s is set by managed AgentGuard; remove the duplicate mcpGateway.env override" $key) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if and (gt (int $pa.replicas) 1) (not .Values.redis.enabled) }}
+{{- fail "pluginAdapter.replicas above 1 needs redis.enabled: the replicas keep the conversations' state and the open answers there" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: plugin-adapter
+  labels:
+    app: plugin-adapter
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+spec:
+  replicas: {{ $pa.replicas }}
+  strategy:
+    type: {{ .Values.fortiaigate.updateStrategy }}
+  selector:
+    matchLabels:
+      app: plugin-adapter
+  template:
+    metadata:
+      annotations:
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+        {{- end }}
+        checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
+      labels:
+        app: plugin-adapter
+    spec:
+      # On a stop the adapter finishes the scans in progress, then sends the
+      # records and traces it still holds: up to 30 seconds.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: plugin-adapter
+        image: {{ .Values.fortiaigate.image.repository }}/plugin-adapter:{{ .Values.fortiaigate.image.tag }}
+        imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - containerPort: 8765
+          name: http
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /plugin/health/readiness
+            port: http
+            {{- if or (not $legacy) .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          # Readiness waits for the config snapshots only, so a cold pod
+          # reports not-ready for a moment; generous so it does not flap. Never
+          # for the licence: an unlicensed adapter stays in rotation and
+          # answers each scan 503, as llm-gateway stays ready and answers 403.
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /plugin/health/liveness
+            port: http
+            {{- if or (not $legacy) .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          {{- toYaml $pa.resources | nindent 10 }}
+        env:
+        {{- if .Values.tls.enabled }}
+        - name: FAIG_INTERNAL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        - name: FAIG_INTERNAL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
+        {{- end }}
+        {{- if (($pa.resources).limits).memory }}
+        # The adapter derives its memory admission budget AND GOMEMLIMIT from
+        # this, as llm-gateway does, so changing resources.limits.memory moves
+        # both. Guarded on the limit existing: without one, resourceFieldRef
+        # falls back to the NODE's allocatable memory.
+        - name: FAIG_MEMORY_LIMIT_BYTES
+          valueFrom:
+            resourceFieldRef:
+              containerName: plugin-adapter
+              resource: limits.memory
+              divisor: "1"
+        {{- end }}
+        {{- with (($pa.env).maxInflightBytes) }}
+        # Absolute override; normally UNSET so the value above governs.
+        - name: FAIG_MAX_INFLIGHT_BYTES
+          value: {{ . | quote }}
+        {{- end }}
+        - name: PLUGIN_ADAPTER_LISTEN_ADDR
+          value: ":8765"
+        # The second listener, plain, which the binary keeps on a loopback
+        # address: plugin-adapter-mcp's, in this pod.
+        - name: PLUGIN_ADAPTER_LOOPBACK_ADDR
+          value: "127.0.0.1:8766"
+        - name: PLUGIN_ADAPTER_ENABLE_LEGACY_DEV_AUTH
+          value: {{ $legacy | quote }}
+        - name: PLUGIN_ADAPTER_MANAGED
+          value: {{ not $legacy | quote }}
+        {{- if not $legacy }}
+        - name: FAIG_ORGANIZATION_ID
+          value: {{ ternary "" $pa.managedAuth.organizationId $.Values.auth.enabled | quote }}
+        - {name: FAIG_SETUP_ORGANIZATION, value: {{ $.Values.auth.enabled | quote }}}
+        # Signs the companion admissions to Observability and Action Guard.
+        - name: FAIG_INTERNAL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "fortiaigate.internalTokenSecretName" . }}
+              key: internal-token
+        # The adapter authenticates the employee itself: Auth, over mTLS with
+        # the Plugins card's workload certificate (pluginAdapterMcp.
+        # workloadTlsSecretName, the identity Auth lets resolve the card's
+        # resource), resolves the OAuth token plugin-adapter-mcp forwards.
+        - name: FAIG_AUTH_URL
+          value: {{ ternary "https://auth:9000" (.Values.mcpGateway.env).FAIG_AUTH_URL .Values.auth.enabled | quote }}
+        - name: FAIG_AUTH_WORKLOAD_CERT_FILE
+          value: "/var/run/faig-workload/tls.crt"
+        - name: FAIG_AUTH_WORKLOAD_KEY_FILE
+          value: "/var/run/faig-workload/tls.key"
+        - name: FAIG_AUTH_SERVER_CA_FILE
+          value: "/var/run/faig-workload/ca.crt"
+        {{- end }}
+        # The guardrail dispatcher pool: the gateway's, from the same value
+        # (as api.yaml takes it). It serves TLS exactly when tls.enabled, on
+        # the internal certificate, verified here as fabric verifies it (the
+        # server name is the host of the address, which its SANs carry); under
+        # tls.mutual the pool requires the client's certificate, the internal
+        # pair.
+        - name: FAIG_GUARDRAIL_ADDR
+          value: {{ (.Values.llmGateway.env).guardrailAddr | default "guardrail:50051" | quote }}
+        - name: FAIG_GUARDRAIL_TLS
+          value: {{ .Values.tls.enabled | ternary "verify" "off" | quote }}
+        {{- if .Values.tls.enabled }}
+        - name: FAIG_GUARDRAIL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        - name: FAIG_GUARDRAIL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_GUARDRAIL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
+        {{- end }}
+        # The guardrail's scan limit, from the value guardrail.yaml gives the
+        # dispatcher: the adapter's body limit follows from it, so the plugin
+        # meets one limit.
+        - name: GUARDRAIL_MAX_REQUEST_BYTES
+          value: {{ ((.Values.guardrail).env).maxRequestBytes | default "10485760" | quote }}
+        # Each tool call and tool output judged by Action Guard (always
+        # deployed) with the key's MCP policies, in the conversation's history,
+        # as mcp-gateway has its calls judged; the tool definitions stay on the
+        # guardrail.
+        - name: ACTION_GUARD_URL
+          value: {{ include "fortiaigate.companionURL" (dict "root" $ "name" "action-guard" "port" 8002) | quote }}
+        # Each conversation, registered in Observability and recorded under the
+        # session id it gives: its prompts, answers, tool calls and outputs.
+        - name: OBSERVABILITY_URL
+          value: {{ include "fortiaigate.companionURL" (dict "root" $ "name" "observability" "port" 8004) | quote }}
+        {{- with (($pa.env).inStream).windowChars }}
+        # The streamed answer's scan window, in characters, the gateway's pair
+        # (docs/workflows/in-stream-scan.md). Rendered only when set, so the
+        # binary's defaults (1024 / 256) stay the single source of truth.
+        - name: FAIG_INSTREAM_WINDOW_CHARS
+          value: {{ . | quote }}
+        {{- end }}
+        {{- with (($pa.env).inStream).holdbackChars }}
+        - name: FAIG_INSTREAM_HOLDBACK_CHARS
+          value: {{ . | quote }}
+        {{- end }}
+        - name: PLUGIN_ADAPTER_VAULT_IDLE
+          value: {{ $pa.vaultIdle | quote }}
+        # With more than one replica the open streamed answers are kept in
+        # Redis too, so that any replica takes the next part of an answer.
+        # One replica keeps them in its memory, where Redis cannot fail them.
+        - name: PLUGIN_ADAPTER_SHARED_STREAMS
+          value: {{ gt (int $pa.replicas) 1 | quote }}
+        - name: PLUGIN_ADAPTER_SCAN_TIMEOUT_SECONDS
+          value: {{ $pa.scanTimeoutSeconds | quote }}
+        - name: PLUGIN_ADAPTER_LOG_CONTENT
+          value: {{ $pa.logContent | quote }}
+        # The traffic log: each scan's record on the faig:logs:plugin Redis
+        # stream, which LogD folds into one traffic-log row per turn.
+        - name: PLUGIN_ADAPTER_TRAFFIC_LOG
+          # Unset (a values file from before the knob, --reuse-values) is on.
+          value: {{ ternary "false" "true" (eq (toString $pa.trafficLog) "false") | quote }}
+        - name: FORTIAIGATE_LOG_LEVEL
+          value: {{ .Values.fortiaigate.env.logLevel | quote }}
+        # The adapter's own listener (the probes; in development mode also the
+        # /plugin route): the external certificate, as api and llm-gateway
+        # serve theirs, unless an AgentGuard certificate applies (see the
+        # header).
+        {{- if $agTls }}
+        - name: FORTIAIGATE_SSL_CERT_FILE
+          value: "/var/run/agentguard-tls/tls.crt"
+        - name: FORTIAIGATE_SSL_KEY_FILE
+          value: "/var/run/agentguard-tls/tls.key"
+        {{- else if .Values.tls.enabled }}
+        - name: FORTIAIGATE_SSL_CERT_FILE
+          value: "/etc/tls-external/tls.crt"
+        - name: FORTIAIGATE_SSL_KEY_FILE
+          value: "/etc/tls-external/tls.key"
+        {{- end }}
+        # The database: the compiled config snapshots and the virtual keys
+        # (read only).
+        - name: POSTGRES_SSL_VERIFY
+          value: "true"
+        - name: POSTGRES_SSL_ENABLED
+          value: {{ .Values.postgresql.tls.enabled | quote }}
+        {{- if .Values.postgresql.tls.enabled }}
+        - name: POSTGRES_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- end }}
+        - name: POSTGRES_USER
+          value: "{{ .Values.postgresql.auth.username }}"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-postgresql
+              key: password
+        - name: POSTGRES_DB
+          value: "{{ .Values.postgresql.auth.database }}"
+        - name: POSTGRES_HOST
+          value: "{{ .Release.Name }}-postgresql"
+        - name: POSTGRES_PORT
+          value: "{{ .Values.postgresql.primary.service.port }}"
+        # The shared Redis's database 0 (REDIS_DB unset), as llm-gateway's: the
+        # virtual-key cache api-go evicts a revoked key from (vk_invalidate),
+        # the count of refused keys per address every module shares, and the
+        # traffic log's faig:logs:plugin stream, which LogD folds into one
+        # traffic-log row per turn.
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_HOST
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_PORT
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-redis
+              key: redis-password
+        - name: REDIS_SSL_VERIFY
+          value: "true"
+        - name: REDIS_SSL_ENABLED
+          value: {{ .Values.redis.tls.enabled | quote }}
+        {{- if .Values.redis.tls.enabled }}
+        - name: REDIS_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- end }}
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        {{- if $agTls }}
+        - name: agentguard-tls
+          mountPath: /var/run/agentguard-tls
+          readOnly: true
+        {{- else if .Values.tls.enabled }}
+        - name: external-tls-certs
+          mountPath: /etc/tls-external
+          readOnly: true
+        {{- end }}
+        {{- if not $legacy }}
+        - name: auth-workload-tls
+          mountPath: /var/run/faig-workload
+          readOnly: true
+        {{- end }}
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        - name: tls-certs
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
+          readOnly: true
+        {{- end }}
+      - name: plugin-adapter-mcp
+        image: {{ .Values.fortiaigate.image.repository }}/plugin-adapter-mcp:{{ .Values.fortiaigate.image.tag }}
+        imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - containerPort: 8767
+          name: mcp
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /api/v1/plugins/health/readiness
+            port: mcp
+            {{- if .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          # Ready once plugin-adapter answers its liveness probe.
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /api/v1/plugins/health/liveness
+            port: mcp
+            {{- if .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          {{- toYaml $gs.resources | nindent 10 }}
+        env:
+        - name: PLUGIN_ADAPTER_MCP_LISTEN_ADDR
+          value: ":8767"
+        # plugin-adapter, the container beside it, on its plain loopback
+        # listener (PLUGIN_ADAPTER_LOOPBACK_ADDR above): the hop never leaves
+        # the pod.
+        - name: PLUGIN_ADAPTER_URL
+          value: "http://127.0.0.1:8766"
+        {{- if $managed }}
+        - name: FAIG_ORGANIZATION_ID
+          value: {{ ternary "" .Values.pluginAdapter.managedAuth.organizationId .Values.auth.enabled | quote }}
+        - {name: FAIG_SETUP_ORGANIZATION, value: {{ .Values.auth.enabled | quote }}}
+        # The database, read only: the inbound policy and the Plugins card's
+        # Auth resource, which its OAuth metadata describes. Who the caller
+        # is, plugin-adapter decides.
+        - name: POSTGRES_SSL_VERIFY
+          value: "true"
+        - name: POSTGRES_SSL_ENABLED
+          value: {{ .Values.postgresql.tls.enabled | quote }}
+        {{- if .Values.postgresql.tls.enabled }}
+        - name: POSTGRES_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- end }}
+        - name: POSTGRES_USER
+          value: "{{ .Values.postgresql.auth.username }}"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-postgresql
+              key: password
+        - name: POSTGRES_DB
+          value: "{{ .Values.postgresql.auth.database }}"
+        - name: POSTGRES_HOST
+          value: "{{ .Release.Name }}-postgresql"
+        - name: POSTGRES_PORT
+          value: "{{ .Values.postgresql.primary.service.port }}"
+        {{- end }}
+        - name: PLUGIN_ADAPTER_SCAN_TIMEOUT_SECONDS
+          value: {{ (.Values.pluginAdapter).scanTimeoutSeconds | default 30 | quote }}
+        {{- if (($gs.resources).limits).memory }}
+        # GOMEMLIMIT and the memory admission budget follow this container's own
+        # limit, as plugin-adapter's do its own. Guarded: without a limit, resourceFieldRef falls
+        # back to the NODE's allocatable memory.
+        - name: FAIG_MEMORY_LIMIT_BYTES
+          valueFrom:
+            resourceFieldRef:
+              containerName: plugin-adapter-mcp
+              resource: limits.memory
+              divisor: "1"
+        {{- end }}
+        {{- with (($gs.env).maxInflightBytes) }}
+        # Absolute override; normally UNSET so the value above governs.
+        - name: FAIG_MAX_INFLIGHT_BYTES
+          value: {{ . | quote }}
+        {{- end }}
+        - name: FORTIAIGATE_LOG_LEVEL
+          value: {{ .Values.fortiaigate.env.logLevel | quote }}
+        {{- if .Values.tls.enabled }}
+        # The MCP listener the ingress routes /api/v1/plugins/claude-code to:
+        # the external certificate, as api and llm-gateway serve theirs.
+        - name: FORTIAIGATE_SSL_CERT_FILE
+          value: "/etc/tls-external/tls.crt"
+        - name: FORTIAIGATE_SSL_KEY_FILE
+          value: "/etc/tls-external/tls.key"
+        {{- end }}
+        volumeMounts:
+        - name: mcp-tmp
+          mountPath: /tmp
+        {{- if .Values.tls.enabled }}
+        - name: external-tls-certs
+          mountPath: /etc/tls-external
+          readOnly: true
+        {{- end }}
+        {{- /* The internal pair: its one internal hop, PostgreSQL. */ -}}
+        {{- if and $managed .Values.postgresql.tls.enabled }}
+        - name: tls-certs
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
+          readOnly: true
+        {{- end }}
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: mcp-tmp
+        emptyDir: {}
+      {{- if .Values.tls.enabled }}
+      - name: external-tls-certs
+        secret:
+          secretName: {{ include "fortiaigate.tlsSecretName" . }}
+      {{- end }}
+      {{- if $agTls }}
+      - name: agentguard-tls
+        secret:
+          secretName: {{ include "fortiaigate.authSecret" (dict "root" . "override" $pa.managedAuth.tlsSecretName) | quote }}
+          {{- include "fortiaigate.authSecretItems" (dict "component" "adapter" "override" $pa.managedAuth.tlsSecretName) | nindent 10 }}
+      {{- end }}
+      {{- if not $legacy }}
+      - name: auth-workload-tls
+        secret:
+          secretName: {{ include "fortiaigate.authSecret" (dict "root" . "override" $gs.workloadTlsSecretName) | quote }}
+          {{- include "fortiaigate.authSecretItems" (dict "component" "plugin-mcp" "override" $gs.workloadTlsSecretName) | nindent 10 }}
+      {{- end }}
+      {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+      - name: tls-certs
+        secret:
+          secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
+      {{- end }}
+      {{- with .Values.fortiaigate.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: plugin-adapter
+  {{- /* The platform Ingress routes /plugin here (templates/ingress.yaml):
+  Traefik dials it over HTTPS, as every routed backend. */}}
+  {{- if eq (include "fortiaigate.ingressController" .) "alb" }}
+  annotations:
+    alb.ingress.kubernetes.io/healthcheck-path: "/plugin/health/readiness"
+    alb.ingress.kubernetes.io/success-codes: "200"
+  {{- else }}
+  {{- with include "fortiaigate.traefikBackendAnnotations" . }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  labels:
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+spec:
+  selector:
+    app: plugin-adapter
+  ports:
+  - protocol: TCP
+    port: 8765
+    targetPort: 8765
+    name: http
+  type: ClusterIP

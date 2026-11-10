@@ -1,4 +1,6 @@
-# Container images
+# FortiAIGate 8.0.2 container images
+
+For the 8.0.3 chart on this branch, see the [build 6207 ECR guide](images-build6207.md). The instructions below apply to build 0055 on `main`.
 
 FortiAIGate 8.0.2 build0055 uses the following images under `var.image_repository`. The tags below were verified against the Docker manifests in the supplied 8.0.2 build0055 archives.
 

@@ -28,9 +28,9 @@ fortiaigate:
     # Specify your container registry address and image tag.
     # Example:
     # repository: 192.168.0.1:5000
-    # tag: V8.0.2-build0055
+    # tag: V8.0.3-build6207
     repository: ""
-    tag: "V8.0.2-build0055"
+    tag: "V8.0.3-build6207"
     pullPolicy: IfNotPresent
     pullSecrets: []
 
@@ -53,6 +53,14 @@ fortiaigate:
     # listed one or set the knobs by hand. `helm get notes <release>` prints the profile in use and where
     # each knob came from.
     type: ""
+
+  # Existing Secret (key "internal-token") for FAIG_INTERNAL_TOKEN, the
+  # platform's service secret: mcp-gateway signs relay sessions with it and
+  # presents it to its companions, plugin-adapter presents it, and
+  # action-guard and observability check it (FAIG_MCP_ADMISSION_KEY). Empty =
+  # a Secret the chart generates and keeps stable across upgrades
+  # (templates/internal-token-secret.yaml).
+  internalTokenExistingSecret: ""
 
   # Update strategy for all Deployment workloads (api, webui, llm-gateway, logd, triton, scanners).
   # Does NOT apply to the license-manager DaemonSet, which always uses RollingUpdate.
@@ -126,6 +134,14 @@ fortiaigate:
 api:
   replicas: 1
 
+  # Read-only hook: fail an incompatible upgrade BEFORE replacing running pods.
+  # Known legacy databases need scripts/schema-upgrade-k8s.sh first. Do not
+  # disable this to bypass a bridge prerequisite. --no-hooks bypasses Helm's
+  # protection and is unsupported for database-bearing upgrades.
+  schemaPreflight:
+    enabled: true
+    timeoutSeconds: 300
+
   # Existing Secret (key "master-key") holding the master key that seals
   # credential secrets at rest. Empty = fall back to a Secret the chart
   # generates and keeps stable across upgrades (templates/master-key-secret.yaml) — a fresh
@@ -176,14 +192,19 @@ llmGateway:
     logRedisPoolSize: 64
     # Timeout in seconds for requests to upstream LLM providers.
     upstreamLlmRequestTimeout: 600
-    # Outbound TLS to upstream LLM providers; verify: false = trust all
-    # (for self-signed backends).
+    # PoC default: skip certificate/hostname validation for outbound LLM
+    # providers AND LLM passthrough relays. Set verify: true to enable it.
+    # Private CA roots can be provided through the standard SSL_CERT_FILE
+    # trust bundle; internal workload mTLS is independent and stays enforced.
     upstreamTls:
-      verify: true
+      verify: false
     # Let the gateway dial upstream endpoints on private (RFC 1918) networks.
     # Needed for any endpoint override onto the cluster network; false gives
     # Bifrost's own SSRF posture for a deployment with no private upstream.
     upstreamAllowPrivateNetwork: true
+    # Set true to filter RFC1918/loopback targets for LLM passthrough relays.
+    # Also set upstreamAllowPrivateNetwork: false for normal LLM traffic.
+    passthroughRefusePrivateTargets: false
     # Seconds an idle connection to an integration's own Base URL (a
     # self-hosted vLLM, an on-prem proxy) stays pooled for reuse. Keep it
     # BELOW that server's keep-alive timeout: uvicorn, which fronts vLLM,
@@ -192,21 +213,27 @@ llmGateway:
     # connections the server already closed and answer 502. Vendor-hosted
     # endpoints are unaffected.
     upstreamBaseUrlKeepaliveTimeout: 4
-    # The in_stream response scan's sliding window, in BYTES
-    # (docs/workflows/in-stream-scan.md). A window scan fires once the window
-    # holds chunkBytes; consecutive windows share overlapBytes — half held
-    # back and judged again with the next window, so a value cut by a window
-    # edge is caught whole, half re-sent as context for the policy judge. The
-    # first bytes reach the client after about chunkBytes of model output.
-    # Empty = the binary's defaults (4096 / 1024). overlapBytes must be even
-    # and at most half of chunkBytes, chunkBytes at least 1024; an unusable
-    # pair falls back to the defaults with a startup WARN. An org may override
-    # the chunk through its Runtime Default stream_scan_buffer_chars (the API
-    # field streamScanBufferChars; 0 = unset): set, it governs that org's
-    # streams, with this overlap clamped to half of it.
+    # The in_stream response scan's window, in CHARACTERS
+    # (docs/workflows/in-stream-scan.md). Every scan judges all the answer so
+    # far; the pair only paces the scans: one fires once the window — the
+    # text not yet released, the hold-back of the previous scan included —
+    # holds windowChars, and holdbackChars of its tail are kept back and
+    # judged again with the next scan, so a value cut by a scan edge is
+    # caught whole; the policy judge reads the whole answer as context. The
+    # first text reaches the client after about windowChars of model output,
+    # then about windowChars minus holdbackChars per scan. Empty = the
+    # binary's defaults (1024 / 256). Floors 100 / 100 (a value below falls
+    # back to the defaults with a startup WARN); a hold-back above half the
+    # window is clamped to half, with a WARN. An org may override the window
+    # through its Runtime Default stream_scan_buffer_chars (the API field
+    # streamScanBufferChars; 0 = unset): set, it governs that org's streams,
+    # with this hold-back clamped to half of it. fabric.inStream below is the
+    # same pair for FortiGate streams. Renamed from chunkChars / overlapChars
+    # on 2026-11-05 (chunkBytes / overlapBytes before 2026-11-01); the old
+    # keys are ignored, and helm prints a warning.
     inStream:
-      chunkBytes: ""
-      overlapBytes: ""
+      windowChars: ""
+      holdbackChars: ""
 
   resources:
     limits:
@@ -216,33 +243,262 @@ llmGateway:
       cpu: 1000m
       memory: 2Gi
 
+# The plugin adapter: the FortiAIGate end of the Claude Code plugin
+# (docs/8.0.3/plugin/plugin-faig-interface.md). The plugin sends it a prompt,
+# a tool call, a tool's output and the model's answer (whole or streamed); it
+# has the guardrail dispatcher apply the verified managed policy. Always
+# deployed. Normal clients use the Auth-managed MCP endpoint; the private
+# adapter has no public ingress. The development virtual-key path needs
+# legacyDevAuth.
+pluginAdapter:
+  # Ordinary runtime uses the Auth-managed MCP gateway and private HTTPS.
+  # The direct virtual-key path (X-FAIG-Virtual-Key, judged by the key's
+  # policies) needs this explicit lab-only opt-in.
+  legacyDevAuth: false
+  managedAuth:
+    organizationId: ""
+    # Existing Secret: tls.crt/tls.key for plugin-adapter's server certificate.
+    # The server certificate must cover its DNS. No client CA is needed.
+    # Optional with tls.enabled: unset, the adapter serves the external
+    # certificate (tls.cert), as api and llm-gateway do, and with tls.enabled
+    # false the one Auth issues (auth.enabled). Required only with neither.
+    tlsSecretName: ""
+  # More than one replica needs the chart's Redis (redis.enabled): the
+  # replicas keep each conversation's redaction state, and the answers being
+  # streamed, there, and any replica serves any request. One replica keeps
+  # the answers being streamed in its own memory.
+  replicas: 1
+  # How long a conversation's redaction vault is kept after its last scan (a
+  # Go duration). Every scan resets the clock; it only has to outlast the wait
+  # for the model's answer, which is scanned against the vault and gets the
+  # originals back in place of the placeholders.
+  vaultIdle: "10m"
+  # The adapter's own limit on one scan, in seconds, when the plugin's request
+  # names no timeout_ms.
+  scanTimeoutSeconds: 30
+  # Add a preview of the scanned text to each scan's log line (off: sizes and
+  # verdicts only).
+  logContent: false
+  # Each scan's record goes to the traffic log (Redis, then LogD), where the
+  # scans of one turn are one row beside the gateway's requests. false: the
+  # scans are logged on the adapter's stdout only.
+  trafficLog: true
+  env:
+    # The streamed answer's scan window, in CHARACTERS — the gateway's pair
+    # and rules (llmGateway.env.inStream above,
+    # docs/workflows/in-stream-scan.md): every scan judges all the answer so
+    # far; one fires once the text since the last cut holds windowChars, and
+    # holdbackChars of its tail are kept back and judged again with the next.
+    # The first text reaches the person after about windowChars of model
+    # output, so a SMALLER window shows the answer sooner at the cost of more
+    # scans. Empty = the binary's defaults (1024 / 256), floors 100 / 100; a
+    # hold-back above half the window is clamped to half. Renamed from
+    # chunkBytes / overlapBytes (bytes, 4096 / 1024) on 2026-11-05; those
+    # keys are ignored (helm prints a warning).
+    inStream:
+      windowChars: ""
+      holdbackChars: ""
+    # The memory admission budget, in bytes, as llm-gateway's
+    # (llmGateway.env.maxInflightBytes): a scan waits, before its body is
+    # read, until the request bodies in flight fit in it. EMPTY (the default)
+    # = a quarter of resources.limits.memory below; a number is an absolute
+    # override.
+    maxInflightBytes: ""
+  resources:
+    limits:
+      cpu: 5000m
+      memory: 4Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+
+# plugin-adapter-mcp — the Claude Code plugin's MCP endpoint (the Connector
+# FortiAIGate AgentGuard, /api/v1/plugins/claude-code/mcp). It forwards each
+# scan, with the caller's credential, to plugin-adapter. Always deployed as a
+# second container in plugin-adapter's pod: pluginAdapter.replicas applies.
+pluginAdapterMcp:
+  # Auth workload Secret (tls.crt, tls.key, ca.crt) plugin-adapter resolves
+  # employee tokens with. Empty uses the automatic Auth identity bundle;
+  # provide an existing Secret when using external Auth.
+  workloadTlsSecretName: ""
+  env:
+    # Memory admission budget in bytes; empty = a quarter of the memory limit.
+    maxInflightBytes: ""
+  # This container's own; the pod asks for the sum with pluginAdapter's.
+  resources:
+    limits:
+      cpu: 5000m
+      memory: 2Gi
+    requests:
+      cpu: 500m
+      memory: 256Mi
+
+# inference-hooks — FortiAIGate's endpoint for Anthropic's Inference hooks
+# (Claude Enterprise). Anthropic's servers POST each signed frame (a prompt, a
+# tool call) to https://<host>/inference-hooks/claude/v1/<endpoint id> and
+# get allow or deny, which the policies of the person's key decide. The
+# endpoint, the signing secret and the failure rules are the card below
+# (inferenceHooks.card). Off by default. The image is
+# <fortiaigate.image.repository>/inference-hooks with the deployment's tag
+# (fortiaigate.image.tag): no tag of its own.
+#
+# PREREQUISITE: Anthropic checks the certificate of the hook URL against the
+# PUBLIC CA trust store, and calls a public host name with an IPv4 address, on
+# port 443, with no redirect. The hook path has the platform's certificate
+# (tls.cert / tls.key): the chart's default, self-signed, fails claude.ai's
+# Test connection, so make the platform's certificate a public CA's.
+inferenceHooks:
+  enabled: false
+  # The server holds no state of its own: the replay cache, the conversation
+  # cursor and the Observability session ids are in the shared Redis, so any
+  # replica serves any frame. Without the chart's Redis (redis.enabled=false)
+  # they are held in the process and the render refuses more than one replica.
+  replicas: 2
+  # The card, required with enabled. In this release the chart sets it; its
+  # console page and API come in a later release. The signing secret and the
+  # header value go to the Secret inference-hooks-card; a change rolls the
+  # pods.
+  card:
+    # The last part of the hook URL that you enter in claude.ai:
+    # https://<host>/inference-hooks/claude/v1/<endpointId>. 32 lowercase
+    # hex characters: `openssl rand -hex 16`. Required.
+    endpointId: ""
+    # The FortiAIGate organization of the frames. Empty = the deployment's
+    # only organization (with two or more, each frame gets 503).
+    organizationId: ""
+    # The signing secret that claude.ai reveals (Request signing), whsec_...
+    # Required. It will move to the card's API configuration (the console) in
+    # a later release.
+    signingSecret: ""
+    # The custom request header that you add in claude.ai. An empty value =
+    # no custom header: the signature alone authenticates a frame. It will
+    # move to the card's API configuration (the console) in a later release.
+    requestHeader:
+      name: X-FAIG-Hook-Token
+      value: ""
+    # The Anthropic organization (tenant_id) a frame must name. Empty = any.
+    tenantId: ""
+    # A person that FortiAIGate does not know: deny, fallback_key (the
+    # SERVICE key fallbackKeyId judges) or allow (unscanned).
+    unmappedActor: deny
+    fallbackKeyId: ""
+    # A redaction that a policy asks for: deny or alert.
+    redactionVerdict: deny
+    # What FortiAIGate answers when it cannot judge a frame (a scanner or
+    # Action Guard failed, or scanTimeoutMs below ended):
+    #   webhook_failure  an error, so the failure handling set in claude.ai
+    #                    decides (Block, Allow or Shadow mode); repeated
+    #                    errors trip Anthropic's circuit breaker.
+    #   deny             fail closed.
+    #   allow            fail open: the request goes on unscanned.
+    failMode: webhook_failure
+    # How long FortiAIGate may take to scan one frame and answer, in ms
+    # (100 to 10000). Keep it below the verdict timeout set in claude.ai
+    # (default 5000 ms), which also covers the network. A frame not judged in
+    # time is answered by failMode above.
+    scanTimeoutMs: 3500
+  env:
+    # The memory admission budget, in bytes, as plugin-adapter's
+    # (pluginAdapter.env.maxInflightBytes): a frame waits, before its body is
+    # read, until the bodies in flight fit in it. EMPTY (the default) = a
+    # quarter of resources.limits.memory below; a number is an absolute
+    # override (FAIG_MAX_INFLIGHT_BYTES).
+    maxInflightBytes: ""
+    # Any other key is an environment variable of the server, rendered
+    # verbatim, e.g.
+    #   INFERENCE_HOOKS_CARD_REFRESH: "30s"
+    # INFERENCE_HOOKS_GATEWAY_HOSTS set here replaces the chart's
+    # (ingress.host). A variable the template sets otherwise is refused:
+    # set its value instead.
+  # The hook route: its own Ingress object, rendered with the server, for
+  # /inference-hooks (Prefix, the path unchanged: the frames and the health
+  # paths) to the Service inference-hooks:8768. No switch: without it the
+  # platform's catch-all / would send Anthropic's frames to the console. It
+  # shares the platform ingress, as auth's routes do: its class
+  # (ingress.className / controllerType), its host (ingress.host) and its
+  # certificate (tls.cert / tls.key, Secret fortiaigate-external-tls-secret;
+  # ACM on an ALB). Anthropic checks that certificate against the PUBLIC CA
+  # trust store: a self-signed one fails Test connection. Its own are its
+  # annotations: a 64m body, a 15 s read timeout and the source-address
+  # restriction below.
+  ingress:
+    # The client addresses that may reach /inference-hooks (the frames and the
+    # health paths). The ingress answers any other address 403, before
+    # FortiAIGate sees the request. It only limits who can reach the server: a
+    # frame from an address in the range is still checked (its signature) and
+    # scanned like any other.
+    # Empty by default: any address can reach the route.
+    # Recommended: set it to Anthropic's range, after you make sure that the
+    # ingress controller sees the original source address of the clients
+    # (externalTrafficPolicy: Local, or PROXY protocol, on the controller's
+    # Service). With Cluster, the Kubernetes default, the controller sees an
+    # internal address instead and refuses every frame, Anthropic's too.
+    #   sourceRanges:
+    #     - 160.79.106.0/24
+    # Rendered as nginx's whitelist-source-range annotation or an ALB's
+    # inbound-cidrs; on Traefik, add an ipAllowList Middleware (annotations).
+    sourceRanges: []
+    # Extra annotations, merged OVER the chart's (yours win key by key), e.g.
+    # the ipAllowList Middleware that restricts the addresses on Traefik:
+    #   traefik.ingress.kubernetes.io/router.middlewares: <namespace>-<name>@kubernetescrd
+    annotations: {}
+  resources:
+    limits:
+      cpu: 5000m
+      memory: 4Gi
+    requests:
+      cpu: 500m
+      memory: 512Mi
+
 # Guardrail data plane.
 guardrail:
+  # Extra inference engines whose real accelerator inventory this dispatcher
+  # must meter. Use when a deployment shares an engine outside this chart.
+  # Each reporter serves /gpu; each metrics endpoint serves /metrics. Never
+  # configure an endpoint that invents an empty inventory or hides a GPU.
+  externalMetering:
+    reporterEndpoints: []
+    metricsEndpoints: []
+    servicePairs: []
   env:
-    # Max characters the model-based scanners (DLP entity detection and
-    # Natural Language policy judging) scan per block; longer content is
-    # truncated and the rest is NOT scanned by them. Regex detectors are not
-    # limited by it: they always scan the whole block (a request is bounded by
-    # maxRequestBytes below). 50000 covers a chat prompt and most
-    # retrieval-augmented ones whole; a long pasted document is cut.
+    # The scan cap: the most of one block, in o200k_base TOKENS (the policy
+    # model's own vocabulary, the count tiktoken gives), that any detector —
+    # regex, DLP entity detection and Natural Language policy judging —
+    # reads. A longer block is judged up to the cap and the rest is NOT
+    # scanned; the traffic log records how much. 8192 is about 35,000
+    # characters of English prose, 18,000 of code or 12,000 of Chinese, and
+    # an 8192-token text fits one policy model call on every GPU profile with
+    # the shipped rule packs. Only the guardrail dispatcher reads it; fabric
+    # tells a FortiGate the cap in characters, 4 a token (32768 at 8192).
     #
-    # It is also what the GPU scan queues charge one block, so it divides how
-    # many long scans run at once: keep GUARDRAIL_DLP_QUEUE_CHARS and
-    # GUARDRAIL_POLICY_QUEUE_CHARS (below) at least ~20x this value, or one
-    # long request can fill a queue on its own and others get HTTP 429.
-    # Raising it scans more of a long document and costs GPU in proportion;
-    # lowering it is the fastest way to cut scan latency if long prompts are
-    # common. Hard ceiling 1500000 (1.5M): a larger value is clamped down to
-    # it, and an empty, zero or invalid value means the ceiling itself.
-    maxScanChars: "50000"
+    # It also sets what the GPU scan queues charge one block, at 4 bytes a
+    # token: keep GUARDRAIL_DLP_QUEUE_CHARS and GUARDRAIL_POLICY_QUEUE_CHARS
+    # (below) at least ~20x that (655,360 at 8192), or one long request can
+    # fill a queue on its own and others get HTTP 429. Raising it scans more
+    # of a long document and costs GPU in proportion, and a fabric /scan2
+    # stream may hold 4x it in characters: past about 32768, raise
+    # fabric.resources.limits.memory too (fabric warns at start when its
+    # streams can outgrow it). Hard ceiling 131072, the policy model's full
+    # context: a larger value is clamped down; an empty or invalid value means
+    # 8192. Replaces maxScanChars (characters), retired on 2026-11-05: a
+    # maxScanChars still set is ignored (helm prints a warning).
+    maxScanTokens: "8192"
     # Scanner detection-cache size, in bytes. Empty = automatic; "0" disables.
     # One knob for both scanner pods, each keeping its own cache against its
-    # own memory limit: dlp-scanner remembers GLiNER predictions per text,
-    # policy-guard remembers policyGuard verdicts per (rules, tool definition)
-    # prompt — the tool list only. The conversation it judges as one combined
-    # text is left to vLLM's prefix cache (vllm.extraArgs below), not kept here.
+    # own memory limit, both keyed per MODEL WINDOW: dlp-scanner remembers
+    # GLiNER predictions per Triton window, policy-guard remembers policyGuard
+    # verdicts per window of a (rules, tool definition) prompt — the tool
+    # list only. A text that grows by appending (a streamed answer scanned as
+    # all the content so far, an agent's history) re-infers only its last
+    # window. The conversation policy-guard judges as one combined text is
+    # left to vLLM's prefix cache (vllm.extraArgs below), not kept here.
     cacheMaxBytes: ""
     # Max size of one scan request, in bytes; a larger request gets HTTP 413.
+    # The plugin adapter's body limit follows from it (its base64 size plus
+    # 64 KiB). Above 47 MiB, that body limit is larger than the ingress's
+    # 64m proxy-body-size, which must then be raised to match. With
+    # pluginAdapterMcp, at most 12533760 (the render fails above): the
+    # adapter's body limit must stay within plugin-adapter-mcp's 16 MiB.
     maxRequestBytes: "10485760"
     # What `short_circuit` means for a scan that does not set it — which is
     # every scan the gateway sends, so this is what decides it in practice. A
@@ -281,8 +537,12 @@ guardrail:
     # Scan-queue limits per pod, in characters of in-flight content. Over
     # capacity a scan is rejected with HTTP 429 (retryable). "0" = no limit.
     env:
-      # Characters normalized and regex-scanned at once (CPU work).
-      # Keep it well above maxRequestBytes.
+      # Characters normalized and regex-scanned at once (CPU work). Keep it
+      # above maxRequestBytes: at 64 MiB one request of ASCII is 67M
+      # characters, two thirds of this queue, so two such requests serialize
+      # and a third waits — acceptable for the one caller that sends them
+      # (the inference-hook adapter, whose bodies are about 10 MB in
+      # practice); raise it if such requests queue.
       GUARDRAIL_PRECHECK_QUEUE_CHARS: "100000000"
       # Characters in flight to each GPU scanner; keep the two values equal.
       # Size to your GPU. EMPTY (the default) takes the fortiaigate.gpu.type
@@ -315,8 +575,8 @@ guardrail:
       CHUNK_SIZE: "512"
       CHUNK_OVERLAP_SIZE: "128"
       # DLP_LOG_SCAN_TEXT: "true"  # DEBUG only: log each judged block's text as scanned
-    # About 1Gi in use while scanning a block at the 1.5M-character
-    # maxScanChars ceiling, far less at the default; the detection cache may
+    # About 1Gi in use while scanning a block at the 131072-token
+    # maxScanTokens ceiling, far less at the default; the detection cache may
     # add up to 25% of the limit on top over time (1Gi at the 4Gi below).
     resources:
       limits:
@@ -335,10 +595,11 @@ guardrail:
     #   POLICYGUARD_STRICTNESS: "medium"        # 1-5, or lowest|low|medium|high|highest
     #   POLICYGUARD_THRESHOLD: ""               # unset = 0.5 (VirtueAI's gate); "0" turns the gate OFF
     #   POLICYGUARD_VLLM_TIMEOUT_SECONDS: "60"  # per model call
-    #   POLICYGUARD_CHUNK_CHARS: "12000"        # longest text per model call
-    #   POLICYGUARD_CHUNK_OVERLAP: "2000"       # characters consecutive windows share
+    #   POLICYGUARD_CHUNK_TOKENS: ""            # cap on the text per model call, in tokens; unset = all the context the rules leave
+    #   POLICYGUARD_CHUNK_OVERLAP_TOKENS: ""    # tokens consecutive windows share; unset = a quarter of the window
+    #   POLICYGUARD_TOKENIZER_FILE: ""          # unset = the policyGuard tokenizer in the image; "none" = estimate instead
     #   POLICYGUARD_MAX_RULE_DEFINITION_CHARS: "48000"  # cap on one detector's rendered rules
-    #   POLICYGUARD_CONTEXT_TOKENS: ""          # model context in TOKENS for the rules pre-flight; unset = learned from vLLM
+    #   POLICYGUARD_CONTEXT_TOKENS: ""          # model context in TOKENS; unset = learned from vLLM
     #   POLICYGUARD_CONCURRENCY: "8"            # model calls in flight per scan
     #   (the verdict cache is sized by guardrail.env.cacheMaxBytes above, not here)
     #   POLICYGUARD_MAX_TOKENS: "8"             # answer cap
@@ -373,40 +634,59 @@ guardrail:
     # A value over 1 could never be cleared, so it is repaired to 0.5 rather
     # than honoured.
     #
-    # CHUNK_CHARS is the longest text judged in one model call; longer content
-    # is split into overlapping windows and every window is judged. Both caps
-    # are CHARACTER counts, the unit a rule author and an operator can see.
+    # WINDOWS ARE SIZED IN THE MODEL'S TOKENS, with the policyGuard
+    # checkpoint's own tokenizer, which the guardrail-scanner image ships.
+    # Longer content is split into overlapping windows and every window is
+    # judged. Each model call carries the detector's whole rules beside one
+    # window, so a window is as long as the context leaves beside them:
+    # vllm.maxModelLen, less the rules, less 21 tokens of template and answer.
+    # On the RTX PRO 6000 and B200 (a 128K context) that is ~126000 tokens
+    # beside a typical shipped pack, so a scan's content is judged whole; at
+    # a 16K context ~14000, and ~9200 beside the largest pack. Nothing here
+    # has to agree with maxModelLen: policy-guard reads it from vLLM, so
+    # raising or lowering it moves the windows with it.
     #
-    # The defaults are chosen so a window always fits beside the rules inside
-    # vllm.maxModelLen, with nothing measured at scan time: 12000 characters of
-    # content plus at most 48000 of rules is roughly 12000 tokens, comfortably
-    # inside a 16384-token context. Raise CHUNK_CHARS for fewer, longer model
-    # calls per document, and check the pair still fits your maxModelLen. A
-    # window the server does refuse as too long is halved and re-judged, so a
-    # cap set too high costs extra calls rather than a failed scan.
+    # CHUNK_TOKENS caps a window below that, for calls the server can batch
+    # more of at once (a long text then costs more calls); unset, there is no
+    # cap but the context.
     #
-    # CHUNK_OVERLAP is what consecutive windows share, so a violation on a
-    # boundary is still seen whole. SET LARGER THAN HALF THE WINDOW, IT IS
-    # REDUCED TO HALF: windows may share at most half of one, or each advances
-    # by so little that nearly every window is judged twice. A smaller value is
-    # always kept as set.
+    # CHUNK_OVERLAP_TOKENS is what consecutive windows share, so a violation on
+    # a boundary is still seen whole: a quarter of the window when unset. SET
+    # LARGER THAN HALF THE WINDOW, IT IS REDUCED TO HALF: windows may share at
+    # most half of one, or each advances by so little that nearly every window
+    # is judged twice. A smaller value is always kept as set.
+    #
+    # TOKENIZER_FILE: at start, once vLLM answers, policy-guard has it tokenize
+    # a test text and compares the result with its own tokenizer's. If they
+    # differ — the image's tokenizer is not the served checkpoint's — the log
+    # says so and windows are ESTIMATED instead (one token per CJK character,
+    # one per three bytes of anything else), as they are with "none". Estimated
+    # windows are smaller than the context allows, so a long text costs more
+    # calls, but it is still scanned. Either way a window the server refuses
+    # as too long is halved and re-judged. The tokenizer takes about 230 MiB of
+    # this pod's memory.
     #
     # MAX_RULE_DEFINITION_CHARS bounds one detector's rendered rules. A
     # detector over it is reported as FAILED rather than scanned against a
-    # truncated policy: reduce its rules or shorten their descriptions. Raising
-    # the cap means raising vllm.maxModelLen to match — rules too long for the
-    # context are the one overflow that splitting the text cannot rescue.
+    # truncated policy: reduce its rules or shorten their descriptions. Every
+    # token of rules is a token less of window, so larger rules mean more calls
+    # per document. Raising the cap means raising vllm.maxModelLen to match —
+    # rules too long for the context are the one overflow that splitting the
+    # text cannot rescue.
     #
     # The cap counts CHARACTERS and the model's limit is in TOKENS, and dense
     # CJK costs about five times more tokens per character than Latin, so a
     # policy authored in Chinese can pass this cap and still not fit. That case
-    # is caught by a PRE-FLIGHT: when a script-aware estimate says the rules
-    # might not fit, the scanner asks the server once (a one-character text
-    # under the full rules) before cutting any window, and fails the detector
-    # with the rules named. One call, and the server's own refusal is the
-    # authority, so the estimate can never fail a detector that works. The
-    # context it believes is on the "policyGuard model endpoint ready" line
-    # (from /v1/models, or POLICYGUARD_CONTEXT_TOKENS, or an assumed 16384).
+    # is caught by a PRE-FLIGHT: when the rules' token count (estimated, where
+    # the tokenizer is off) says they might not fit, the scanner asks the
+    # server once (a one-character text under the full rules) before cutting
+    # any window, and fails the detector with the rules named. One call, and
+    # the server's own refusal is the authority, so a count can never fail a
+    # detector that works. The context it believes is on the "policyGuard
+    # model endpoint ready" line (from /v1/models, or
+    # POLICYGUARD_CONTEXT_TOKENS, or an assumed 16384). The server's figure is
+    # re-read every minute; a change is logged as "policyGuard model context
+    # changed".
     resources:
       limits:
         cpu: "5000m"
@@ -516,22 +796,32 @@ vllm:
   gpuMemoryUtilization: ""
 
   # Largest prompt one scan may send the model, in tokens (a detector's rules,
-  # the content being scanned, and the verdict). It is a ceiling, not a window
-  # size: the policyGuard window is set in characters above
-  # (POLICYGUARD_CHUNK_CHARS beside POLICYGUARD_MAX_RULE_DEFINITION_CHARS) and
-  # nothing re-measures the pair at scan time, so re-check them together
-  # whenever either number moves.
+  # the content being scanned, and the verdict). It is also the policyGuard
+  # WINDOW size: policy-guard reads it from vLLM and cuts each detector's
+  # windows to fill what its rules leave of it (guardrail.policyGuard.env
+  # above), so moving it moves the windows, with nothing else to re-check.
+  # Larger windows let the model connect a reference to its referent across
+  # more of a document, in fewer calls.
   #
   # It does not size the KV cache — gpuMemoryUtilization above does — so
   # raising it costs no extra memory, but vLLM will not start unless the cache
-  # can hold one request of this length. Lowering it does not shrink the window
-  # on its own — it makes the server refuse more of them, and a refused window
-  # is halved and re-judged at the cost of extra model calls — so lower
-  # POLICYGUARD_CHUNK_CHARS with it.
+  # can hold one request of this length. Each window then holds up to this
+  # many tokens of the KV pool while it is judged, so on a small card fewer
+  # windows run at once (pool / max-model-len of them at full length);
+  # POLICYGUARD_CHUNK_TOKENS caps windows below it without moving the server's
+  # ceiling.
   #
-  # Empty (or 0) uses the model's own maximum, which needs a GPU large enough
-  # to hold one request that long.
-  maxModelLen: 16384
+  # EMPTY (the default) takes the fortiaigate.gpu.type profile's value
+  # (files/gpu-profiles.yaml): 131072 (128K), the checkpoint's own maximum, on
+  # the RTX PRO 6000 and B200, where the KV cache holds many requests that
+  # long, so content is judged whole. A number here wins over the profile;
+  # "0" sends no flag and vLLM takes the checkpoint's own maximum. vLLM
+  # refuses more than that maximum. A 24 GB card cannot hold one 128K request
+  # beside Triton (its KV cache holds ~54K tokens): set 16384 there.
+  #
+  # A values file copied from an earlier chart carries 16384 here, which keeps
+  # winning on upgrade: empty it to take the card's profile.
+  maxModelLen: 16384  # Keep the maintained EKS context size for shared GPUs.
 
   # How vLLM gets its GPU — one of three:
   #   auto (default): decided at install or upgrade from the cluster's nodes.
@@ -694,6 +984,199 @@ logd:
       cpu: 500m
       memory: 512Mi
 
+# FortiGate integration: the fabric module (fabric/). FortiGates connect to it
+# directly over HTTP/2 + TLS, register by serial, and, once an admin authorizes
+# them on the WebUI's Fabric Connectors -> Device page, send prompts and model
+# answers to be judged by the guardrails assigned to them.
+# Interface: docs/8.0.3/fabric/technical-spec.pdf.
+# On by default; it opens a port that FortiGates can reach (service below).
+fabric:
+  # Off by default in 8.0.3: set true to deploy the FortiGate integration, the
+  # Deployment and Service `fabric`. Its image is the deployment's own,
+  # <fortiaigate.image.repository>/fabric:<fortiaigate.image.tag>, like every
+  # other module's; there is no per-module tag.
+  enabled: false
+  # Tested with 1. More also work: each replica keeps its own copy of the
+  # device registry, kept in step by PostgreSQL NOTIFY.
+  replicas: 1
+
+  # How FortiGates reach port 8443 of the pod. The pod terminates the TLS
+  # itself (it has to see the FortiGate's client certificate), so this is a
+  # TCP path, never an HTTP Ingress.
+  #   NodePort      (default) <any node IP>:<nodePort>. Needs nothing outside
+  #                 this chart. Pin nodePort (30000-32767) before configuring a
+  #                 FortiGate, because the port is typed into the device.
+  #   LoadBalancer  its own address on `port`. Needs a LoadBalancer
+  #                 implementation with a free address (e.g. MetalLB).
+  #   ClusterIP     no outside path of its own: add externalIPs below, or pass
+  #                 TCP through an existing controller. For ingress-nginx:
+  #                 helm upgrade ingress-nginx ingress-nginx/ingress-nginx -n ingress-nginx \
+  #                   --reuse-values --set tcp.8443=<namespace>/fabric:8443
+  service:
+    type: NodePort
+    port: 8443
+    nodePort: ""
+    # Any type: node addresses that answer on `port` themselves, i.e.
+    # <node IP>:8443 instead of a 30000+ NodePort. `port` must be free on each.
+    externalIPs: []
+    # LoadBalancer only.
+    loadBalancerIP: ""
+    loadBalancerSourceRanges: []
+    # NodePort / LoadBalancer only: Cluster (the Kubernetes default) or Local.
+    externalTrafficPolicy: ""
+    annotations: {}
+
+  # FortiGates are shown the Fortinet-issued certificate in the deployment's
+  # licence as soon as one is installed — the only identity they can verify.
+  # This is not configurable: the former `tls.source: file` and
+  # `tls.existingSecret` are retired and refused. Until a licence is installed
+  # they are shown the chart's internal pair, Secret fortiaigate-tls-secret,
+  # which exists while tls.enabled (or the PostgreSQL / Redis TLS switch) is
+  # on, the default; with all three off the render stops.
+
+  # A FortiGate is authenticated by its Fortinet-issued client certificate,
+  # the only credential: one that presents none is refused (401).
+
+  # A client certificate's CN must equal the FortiGate's serial-number header.
+  # Set false only for FortiGates that present the FIRMWARE certificate
+  # (CN=FortiGate on every unit). The serial is then only the device's own claim.
+  bindSerial: true
+
+  # The organization to serve. Empty = the deployment's only one.
+  orgId: ""
+
+  # Go heap ceiling. Empty (the default) = 9/10 of resources.limits.memory,
+  # which the module reads from the Downward API, as llm-gateway does; a value
+  # here (e.g. 1800MiB) is used as it is instead.
+  goMemLimit: ""
+  # Extra environment variables for settings not listed above, e.g.
+  #   FABRIC_MAX_PENDING: "1000"          devices waiting for authorization at once
+  #   FABRIC_SCAN_TIMEOUT_SECONDS: "30"
+  # Every setting: fabric/README.md.
+  #
+  # FABRIC_TEST_SCAN_DELAY is ON in this chart, so that the FortiGate team can
+  # test the scan time-out with no change to a deployment: it serves
+  # /fabric/api/v1/test/scan_delay, which makes a FortiGate's scans wait,
+  # inside their time-out, on purpose (per replica). The module's own
+  # default is false.
+  # TURN IT OFF BEFORE THE FINAL RELEASE: delete the entry below. A deployment
+  # turns it off now with --set-string fabric.env.FABRIC_TEST_SCAN_DELAY=false
+  env:
+    FABRIC_TEST_SCAN_DELAY: "true"
+
+  # The /scan2 stream scan window, in CHARACTERS: the same pair as
+  # llmGateway.env.inStream above, for FortiGate streams. Every scan judges
+  # all the answer so far; a scan fires once the text past `scanned` holds
+  # windowChars, and holdbackChars of its tail are kept back and judged again
+  # with the next scan. Empty = the module's defaults (1024 / 256), floors
+  # 100 / 100; a hold-back above half the window is clamped to half, with a
+  # WARN at start. Beside `env`, not inside it: `env` is rendered verbatim.
+  # Renamed from chunkChars / overlapChars on 2026-11-05; the old keys are
+  # ignored, and helm prints a warning.
+  inStream:
+    windowChars: ""
+    holdbackChars: ""
+
+  resources:
+    limits:
+      cpu: 5000m
+      memory: 2Gi
+    requests:
+      cpu: 1000m
+      memory: 512Mi
+
+# Action Guard — agent tool-call guard on :8002: a proposed action gets allow /
+# alert / block / human_approval. Always deployed; mcp-gateway calls it. Topic
+# Guard runs in-process over this chart's guardrail pool, with the MCP
+# guardrails of the agent policies. Its own database and Redis index on the
+# shared servers.
+actionGuard:
+  replicas: 1
+
+  # Extra environment, rendered verbatim. Do not repeat DATABASE_URL,
+  # REDIS_URL or REDIS_CLUSTER, which the template sets. Overridable here:
+  # EVENT_BUS_ENABLED (true),
+  # FAIG_GUARDRAIL_ADDR (guardrail:50051), DB_POOL_SIZE / DB_MAX_OVERFLOW
+  # (10 / 5), SESSION_HISTORY_MAX_TRACES (24: the newest session traces a
+  # tool call is judged with, 0 = all); the rest with their defaults in
+  # action-guard/internal/config/config.go. An unknown (misspelled) key is
+  # ignored silently.
+  env: {}
+
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+    requests:
+      cpu: 250m
+      memory: 512Mi
+
+# MCP Gateway. Always deployed. Agents call /mcp/gateways/{id} with a virtual
+# key through the platform ingress; api-go serves the /api/v1 MCP routes
+# itself, and the gateway runs the discovery and scan jobs it queues.
+mcpGateway:
+  replicas: 1
+  # PoC default for governed MCP servers AND true-passthrough endpoints.
+  # Set verify: true to validate upstream certificates and hostnames. A private
+  # CA must then be included in the service's SSL_CERT_FILE trust bundle.
+  upstreamTls:
+    verify: false
+  egress:
+    # Empty = allow configured public/private hosts and nonstandard ports.
+    # Opt in to filtering: allowedHosts: ["mcp.example.com", "10.0.0.8:8443"].
+    # A hostname permits any port; host:port restricts that port too.
+    allowedHosts: []
+  # Workload Secret (tls.crt, tls.key, ca.crt) for Auth; required with
+  # auth.enabled.
+  workloadTlsSecretName: ""
+
+  # Extra environment, rendered verbatim (mcp-gateway/src/config/config.go);
+  # do not repeat what the template sets. Bump MCP_SCAN_MODEL_REVISION with
+  # each policyGuard model release, so auto-scans run again.
+  env: {}
+
+  resources:
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+    requests:
+      cpu: 250m
+      memory: 512Mi
+
+  # The pod's stdio-runner container, where stdio MCP servers (npx / python)
+  # run: one process per discovery and per tool call.
+  stdioRunner:
+    # An npx server takes some 200 MiB, and an out-of-memory kill ends every
+    # server at once.
+    resources:
+      limits:
+        cpu: 1000m
+        memory: 1Gi
+      requests:
+        cpu: 100m
+        memory: 256Mi
+
+# Observability — agent session/trace recording on :8004. Always deployed;
+# mcp-gateway and plugin-adapter record there, action-guard reads the session
+# history. The session log is in FortiAIGate's database; its trace cache is
+# its own Redis index on the shared server.
+observability:
+  replicas: 1
+
+  # Extra environment, rendered verbatim. The session pool uses Helm defaults
+  # of 25 + 10 = 35 maximum connections per replica.
+  env:
+    DB_POOL_SIZE: "25"
+    DB_MAX_OVERFLOW: "10"
+
+  resources:
+    limits:
+      cpu: 500m
+      memory: 512Mi
+    requests:
+      cpu: 100m
+      memory: 128Mi
+
 # Storage Configuration
 storage:
   # Storage size and class configuration for API and Core services
@@ -723,6 +1206,8 @@ sso:
 
 # Ingress Configuration
 ingress:
+  # Controller type for a custom class (e.g. className: qa23443, controllerType: nginx).
+  controllerType: ""
   className: "nginx" # You need update this to your ingress used
   host: ""  # Optional: Set to a specific hostname to enable host-based routing
   # Custom annotations that take priority over predefined controller settings
@@ -741,6 +1226,14 @@ ingress:
     api: /openapi.json
     llmGateway: /fortiaigate/health/readiness
     webui: /ui
+  # Traefik with tls.enabled: the backend Services carry the HTTPS scheme and a
+  # ServersTransport, whatever annotations says (Traefik reads the backend
+  # scheme off the Service only). Empty = the chart renders
+  # fortiaigate-backend-tls, which, as ingress-nginx and an ALB, does not verify
+  # the backend certificate. To verify, name your own ServersTransport here
+  # (with your CA and serverName) as <namespace>-<name>@kubernetescrd.
+  traefik:
+    serversTransport: ""
 
 # TLS Configuration
 tls:
@@ -754,11 +1247,27 @@ tls:
   internalExistingSecretChecksum: ""
   internalMountPath: "/etc/internal-tls"
 
+  # Mutual TLS between the deployment's own pods (needs enabled): every
+  # internal server also requires the client's certificate, so only a pod that
+  # holds the deployment's internal key gets in. It covers the guardrail pool
+  # (guardrail, dlp-scanner, policy-guard), the licence manager, Action Guard,
+  # Observability, Triton's gRPC port and vLLM; a client presents the same
+  # internal certificate the servers serve, whose key usage allows both. The
+  # health paths (the licence manager's and Observability's /healthz and
+  # /readyz, Action Guard's /healthz, the guardrail pool's health port) stay
+  # open for the kubelet, which presents no certificate. PostgreSQL and Redis
+  # have their own switches, postgresql.tls.certCAFilename and
+  # redis.tls.authClients, both on.
+  mutual: true
+
   # TLS mount path in containers
   mountPath: "/etc/tls"
 
-  # Certificate data (used to create secrets)
-  # You need to provide your own certificate and key
+  # The certificate the Ingress, and every service it routes to (webui, api,
+  # llm-gateway, plugin-adapter, mcp-gateway, inference-hooks), present to
+  # clients (self-signed or signed by a CA). You need to provide your own
+  # certificate and key. Traffic between the pods uses a certificate the chart
+  # generates.
   cert: files/certificate/dflt.crt
   key: files/certificate/dflt.key
 
@@ -786,6 +1295,10 @@ postgresql:
     certFilename: "tls.crt"
     # Certificate key filename in the secret
     certKeyFilename: "tls.key"
+    # The CA PostgreSQL verifies client certificates against: the internal
+    # certificate itself. With it the rules below require one (mutual TLS);
+    # empty leaves them password-only.
+    certCAFilename: "tls.crt"
     # Prefer server ciphers
     preferServerCiphers: true
 
@@ -798,13 +1311,39 @@ postgresql:
       tag: 12-debian-12-r50
 
   primary:
+    # Restart PostgreSQL when the chart-generated internal certificate changes
+    podAnnotations:
+      checksum/tls: '{{ if .Values.tls.enabled }}{{ include "fortiaigate.internalTlsRevision" . | sha256sum }}{{ end }}'
+    # Client authentication (pg_hba.conf). With postgresql.tls.enabled,
+    # PostgreSQL accepts a client from another pod only over TLS (hostssl),
+    # and refuses a plaintext login whatever its password. With
+    # tls.certCAFilename as well it is mutual TLS: the client must also present
+    # a certificate that verifies against that file (clientcert=verify-ca), on
+    # top of its password. Every pod that uses the database presents the
+    # internal pair (POSTGRES_SSL_CERTFILE/KEYFILE). Without
+    # postgresql.tls.enabled these are the image's own rules (host), so the
+    # clients still get in. The local socket and the loopback stay open: only
+    # processes in the PostgreSQL pod reach them, its pg_isready probes on
+    # 127.0.0.1 among them. md5 also takes a password stored as SCRAM, with
+    # SCRAM.
+    # The sub-chart renders this as a template, so .Values.tls here is
+    # postgresql.tls; it mounts the result as a ConfigMap at
+    # /bitnami/postgresql/conf and restarts PostgreSQL when it changes. It
+    # must never render empty: an empty pg_hba.conf refuses every client.
+    pgHbaConfiguration: |-
+      # Managed by the FortiAIGate chart (postgresql.primary.pgHbaConfiguration).
+      local    all  all                 md5
+      host     all  all  127.0.0.1/32   md5
+      host     all  all  ::1/128        md5
+      {{ ternary "hostssl" "host" .Values.tls.enabled }}  all  all  0.0.0.0/0  md5{{ if and .Values.tls.enabled .Values.tls.certCAFilename }}  clientcert=verify-ca{{ end }}
+      {{ ternary "hostssl" "host" .Values.tls.enabled }}  all  all  ::/0       md5{{ if and .Values.tls.enabled .Values.tls.certCAFilename }}  clientcert=verify-ca{{ end }}
     persistence:
       enabled: true
       size: 16Gi
       storageClass: ""
       # Use existing PVC created by storage configuration
       # This will be automatically set to the correct PVC name by the template
-      existingClaim: "fortiaigate-storage"
+      existingClaim: '{{ include "fortiaigate.storageClaim" . }}'
       # Access modes for the PVC (e.g., ["ReadWriteOnce", "ReadWriteMany"])
       # Leave empty to use default from storage class
       # For advanced options, see Bitnami PostgreSQL documentation
@@ -844,8 +1383,10 @@ redis:
     certKeyFilename: "tls.key"
     # CA Certificate filename in the secret
     certCAFilename: "tls.crt"
-    # Disable client authentication (mutual TLS)
-    authClients: false
+    # Mutual TLS: Redis also requires the client's certificate, verified
+    # against certCAFilename. Every pod that dials Redis presents the internal
+    # pair (REDIS_SSL_CERTFILE/KEYFILE), and so do the sub-chart's probes.
+    authClients: true
 
   # Redis configuration. Keep all four lines: this block replaces the Redis
   # sub-chart's defaults entirely, so removing appendonly/save turns persistence
@@ -853,9 +1394,12 @@ redis:
   # leave the node unlicensed until it re-registers.
   #
   # maxmemory must stay BELOW master.resources.limits.memory below, with room to
-  # spare (1200mb against 2Gi): background saves need extra memory, and a Redis
-  # that reaches the container limit is killed rather than slowed. Raise both
-  # together if you raise either.
+  # spare (2048mb against 4Gi): background saves need extra memory, and a
+  # Redis that reaches the container limit is killed rather than slowed. Raise
+  # both together if you raise either.
+  #
+  # master.resources.requests.memory is at least maxmemory, so that a node that
+  # runs short of memory does not evict Redis first. Raise it with maxmemory.
   #
   # noeviction means Redis refuses new writes when full instead of discarding
   # data it already holds. Do not change it to an eviction policy — those would
@@ -865,17 +1409,20 @@ redis:
     appendonly yes
     # Disable RDB persistence, AOF persistence already enabled.
     save ""
-    maxmemory 1200mb
+    maxmemory 2048mb
     maxmemory-policy noeviction
 
   master:
+    # Restart Redis when the chart-generated internal certificate changes
+    podAnnotations:
+      checksum/tls: '{{ if .Values.tls.enabled }}{{ include "fortiaigate.internalTlsRevision" . | sha256sum }}{{ end }}'
     persistence:
       enabled: true
       size: 4Gi
       storageClass: ""
       # Use existing PVC created by storage configuration
       # This will be automatically set to the correct PVC name by the template
-      existingClaim: "fortiaigate-storage"
+      existingClaim: '{{ include "fortiaigate.storageClaim" . }}'
       # Access modes for the PVC (e.g., ["ReadWriteOnce", "ReadWriteMany"])
       # Leave empty to use default from storage class
       # For advanced options, see Bitnami Redis documentation
@@ -883,10 +1430,50 @@ redis:
     resources:
       limits:
         cpu: 1000m
-        memory: 2Gi
+        memory: 4Gi
       requests:
         cpu: 250m
-        memory: 512Mi
+        memory: 2Gi
     service:
       type: ClusterIP
       port: 6379
+
+# Auth starts on the first installation. Its identity Job creates persistent
+# workload/vault/signing material. Organization and public URL come from setup.
+auth:
+  # Running LLM replicas require bundled Auth for RBAC usage accounting.
+  # External-Auth MCP-only deployments must set llmGateway.replicas to 0.
+  enabled: true
+  autoProvision: true
+  image: auth
+  replicas: 1
+  # Optional existing component Secrets use ordinary, unprefixed file keys.
+  # Empty names use the persistent installation bundle created automatically.
+  serverSecretName: ""
+  apiWorkloadSecretName: ""
+  llmWorkloadSecretName: ""
+  llmWorkloadIdentity: spiffe://faig/deployment/llm-gateway
+  # Provisioned API/MCP/LLM certificates must contain these URI SANs.
+  apiWorkloadIdentity: spiffe://faig/deployment/api
+  mcpWorkloadIdentity: spiffe://faig/deployment/mcp-gateway
+  pluginAdapterMcpWorkloadIdentity: spiffe://faig/deployment/plugin-adapter-mcp
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 2000m, memory: 1Gi}
+  # Optional provider egress policy file; mount it through a separate Secret.
+  egressSecretName: ""
+  upstreamTls:
+    # PoC default for external OAuth, JWKS, UserInfo, refresh, discovery and
+    # directory/exchange requests. Token signatures/claims and workload mTLS
+    # are still verified. Set true to validate provider certificates.
+    verify: false
+    # Optional existing Secret with key ca.crt, appended to system roots when
+    # verification is enabled. Example: caSecretName: company-idp-ca
+    caSecretName: ""
+  egress:
+    # No vendor allowlist by default. Configured HTTPS endpoints may be on
+    # public/private networks and arbitrary HTTPS ports.
+    # To filter, set e.g. allowedHosts: ["login.microsoftonline.com", "idp.example.com:8446"].
+    # The legacy egressSecretName policy remains an explicit exact-URL/CA
+    # restriction when configured; leave it empty for the default open policy.
+    allowedHosts: []

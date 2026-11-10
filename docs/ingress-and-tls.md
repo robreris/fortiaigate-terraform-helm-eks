@@ -44,7 +44,7 @@ AWS references: [controller annotations and precedence](https://kubernetes-sigs.
 
 ## Web and internal certificates
 
-Terraform creates a per-deployment CA and a serving certificate covering the ingress host, localhost, and the 8.0.2 Kubernetes Service DNS names. It creates two Secrets:
+Terraform creates a per-deployment CA and a serving certificate covering the ingress host, localhost, and the web-facing Kubernetes Service DNS names. It creates two Secrets:
 
 - `fortiaigate-tls-secret`: API, LLM gateway, WebUI, and the nginx frontend.
 - `fortiaigate-internal-tls-secret`: guardrail services, LogD, license manager, PostgreSQL, Redis, and database client mounts. Its `ca.crt` is the generated CA.

@@ -37,6 +37,15 @@
 #                               from it (values.yaml triton.dlpMaxBatchSize)
 #   triton.cpuLimit             triton.resources.limits.cpu: one core per DLP
 #                               instance per card, plus one
+#   vllm.maxModelLen            --max-model-len: the longest prompt + answer
+#                               one request may be, in tokens — and so the
+#                               policyGuard window, which fills what a
+#                               detector's rules leave of it. "0" = no flag,
+#                               the checkpoint's own maximum (131072 for the
+#                               shipped gpt-oss policyGuard; vLLM refuses
+#                               more). vLLM refuses to START when its KV cache
+#                               cannot hold one request this long
+#                               (values.yaml vllm.maxModelLen)
 #   vllm.maxNumSeqs             --max-num-seqs          (values.yaml vllm.maxNumSeqs)
 #   vllm.apiServerCount         --api-server-count      (vllm.apiServerCount)
 #   vllm.blockSize              --block-size; "" = the engine's own default (vllm.blockSize)
@@ -56,12 +65,17 @@
 # `default` IS the RTX PRO 6000 tuning, the card the product is qualified on;
 # it is also what any card not listed here gets.
 default:
-  description: "The NVIDIA RTX PRO 6000 Blackwell (96 GB) tuning, measured with vLLM sharing the card: 3 DLP instances batching up to 16 windows, 2 vLLM API servers. Also what any card not listed gets."
+  description: "The NVIDIA RTX PRO 6000 Blackwell (96 GB) tuning, measured with vLLM sharing the card: 3 DLP instances batching up to 16 windows, 2 vLLM API servers, a 128K-token context. Also what any card not listed gets."
   triton:
     dlpInstancesPerGpu: 3
     dlpMaxBatchSize: 16
     cpuLimit: 5000m
   vllm:
+    # The checkpoint's own maximum (gpt-oss: YaRN 4096 x 32), so a scan's
+    # text is judged in one window wherever it fits beside the rules. A
+    # 128K-token request takes ~3.5 GiB of KV cache; the RTX PRO 6000 has
+    # ~59 GiB beside Triton (~17 such requests at once), the B200 more.
+    maxModelLen: 131072
     maxNumSeqs: 512
     apiServerCount: 2
     blockSize: ""
@@ -77,17 +91,20 @@ rtx-pro-6000:
 
 l4:
   devOnly: true
-  description: "NVIDIA L4, 24 GB. Development environments only: one DLP instance is all that fits beside vLLM on the shared card, batching up to 16 windows."
+  description: "NVIDIA L4, 24 GB. Development environments only: one DLP instance is all that fits beside vLLM on the shared card, batching up to 8 windows, and a 16K-token context."
   triton:
     dlpInstancesPerGpu: 1
     dlpMaxBatchSize: 8
   vllm:
+    # The KV cache beside Triton holds ~54K tokens (measured at 0.80): a
+    # 128K-token request would not fit at all, and 16K leaves three at once.
+    maxModelLen: 16384
     maxNumSeqs: 64
     apiServerCount: 1
     cpuRequest: 1000m
 
 b200:
-  description: "NVIDIA B200. 4 DLP instances batching up to 32 windows, 4 vLLM API servers on 8 cores, 128-token KV-cache blocks."
+  description: "NVIDIA B200. 4 DLP instances batching up to 32 windows, 4 vLLM API servers on 8 cores, 128-token KV-cache blocks, a 128K-token context."
   triton:
     dlpInstancesPerGpu: 4
     dlpMaxBatchSize: 32

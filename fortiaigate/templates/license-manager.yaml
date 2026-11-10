@@ -17,8 +17,6 @@ metadata:
     app.kubernetes.io/managed-by: helm
     component: license-manager
     version: v1
-  annotations:
-    deployment.kubernetes.io/revision: "1"
 spec:
   replicas: {{ .Values.license_manager.replicas }}
   selector:
@@ -27,8 +25,11 @@ spec:
       component: license-manager
   template:
     metadata:
+      {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
       annotations:
-        checksum/tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+        # Restart the pod when the chart-generated internal certificate changes
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
+      {{- end }}
       labels:
         app: license-manager
         component: license-manager
@@ -101,14 +102,32 @@ spec:
           value: {{ .Values.fortiaigate.env.logLevel | quote }}
         {{- if .Values.tls.enabled }}
         - name: FORTIAIGATE_SSL_CERT_FILE
-          value: {{ printf "%s/tls.crt" .Values.tls.mountPath | quote }}
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         - name: FORTIAIGATE_SSL_KEY_FILE
-          value: {{ printf "%s/tls.key" .Values.tls.mountPath | quote }}
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        # The CA the accelerator meter verifies the guardrail pool against,
+        # and, under mutual TLS, the one the API verifies its clients against
+        - name: FAIG_INTERNAL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        # Mutual TLS (tls.mutual): the client certificate this pod presents to
+        # the servers that require one, the internal pair itself
+        - name: FAIG_INTERNAL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        # Mutual TLS: the API (:9443) serves only a client whose certificate
+        # verifies against the internal certificate; /healthz and /readyz stay
+        # open for the kubelet's probes, which present none
+        - name: FAIG_INTERNAL_TLS_CLIENT_AUTH
+          value: "require"
+        {{- end }}
         {{- end }}
         # PostgreSQL: the licences, the coverage snapshot, the leader lease and
-        # the FortiGuard client id all live here. Redis is GONE from the licence
-        # path entirely — which also means wiping Redis can no longer invalidate
-        # a licence.
+        # the FortiGuard client id all live here. Redis below carries audit
+        # events only — wiping Redis can no longer invalidate a licence.
         - name: POSTGRES_USER
           value: "{{ .Values.postgresql.auth.username }}"
         - name: POSTGRES_PASSWORD
@@ -125,12 +144,45 @@ spec:
         {{- if .Values.postgresql.tls.enabled }}
         - name: POSTGRES_SSL_ENABLED
           value: "true"
-        - name: POSTGRES_SSL_CERTFILE
-          value: {{ printf "%s/tls.crt" (include "fortiaigate.dbTlsMountPath" .) | quote }}
-        - name: POSTGRES_SSL_KEYFILE
-          value: {{ printf "%s/tls.key" (include "fortiaigate.dbTlsMountPath" .) | quote }}
         - name: POSTGRES_SSL_CA_CERTS
-          value: {{ printf "%s/%s" (include "fortiaigate.dbTlsMountPath" .) (include "fortiaigate.dbTlsCAFile" .) | quote }}
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: POSTGRES_SSL_VERIFY
+          value: "true"
+        # The client certificate PostgreSQL requires with
+        # postgresql.tls.certCAFilename: the internal pair
+        - name: POSTGRES_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
+        # Redis: the audit event of an Agent Security switch change goes to
+        # LogD's audit stream.
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_HOST
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_PORT
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-redis
+              key: redis-password
+        - name: REDIS_SSL_ENABLED
+          value: {{ .Values.redis.tls.enabled | quote }}
+        {{- if .Values.redis.tls.enabled }}
+        - name: REDIS_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        - name: REDIS_SSL_VERIFY
+          value: "true"
         {{- end }}
         # The guardrail dispatcher answers the accelerator inventory the
         # coverage verdict is computed from. Unset would mean the fleet cannot
@@ -171,10 +223,9 @@ spec:
           mountPath: /tmp
         {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
         - name: tls-certs
-          mountPath: {{ .Values.tls.mountPath | quote }}
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
           readOnly: true
         {{- end }}
-      {{- include "fortiaigate.dbTlsVolumeMount" . | nindent 8 }}
       volumes:
       - name: tmp
         emptyDir: {}
@@ -183,7 +234,6 @@ spec:
         secret:
           secretName: {{ include "fortiaigate.internalTlsSecretName" . }}
       {{- end }}
-      {{- include "fortiaigate.dbTlsVolume" . | nindent 6 }}
       {{- with .Values.fortiaigate.image.pullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

@@ -15,6 +15,7 @@ CLOSED (gateway 503) rather than silently passing.
 {{- $repo := .Values.fortiaigate.image.repository -}}
 {{- $tag := (.Values.guardrail).tag | default .Values.fortiaigate.image.tag -}}
 {{- $g := .Values.guardrail | default dict -}}
+{{- $externalMetering := $g.externalMetering | default dict -}}
 {{- /* Traffic-normalization DECODE policy (values.yaml
        guardrail.trafficNormalization.decode), rendered onto the dispatcher only
        — it is the pod that runs the stage. `default` is unusable for the
@@ -52,10 +53,9 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/tls: {{ include "fortiaigate.internalTlsChecksum" $ | quote }}
         {{- if $.Values.tls.enabled }}
-        # restart the pod when the TLS cert/key change
-        checksum/config: {{ printf "%s%s" (tpl ($.Files.Get $.Values.tls.cert) $) (tpl ($.Files.Get $.Values.tls.key) $) | sha256sum }}
+        # restart the pod when the chart-generated internal certificate changes
+        checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" $ | quote }}
         {{- end }}
       labels:
         app: guardrail
@@ -101,10 +101,12 @@ spec:
         # The scan-request cap. Enforced ONCE, at the dispatcher's receiving
         # side (the scanners and every client run at the transport ceiling,
         # and replies are never size-capped, so oversized rewritten results
-        # still flow back); also what ListCapabilities advertises. No other
-        # pod needs this value.
+        # still flow back); also what ListCapabilities advertises. The plugin
+        # adapter reads the same value to size its body limit
+        # (plugin-adapter.yaml), and inference-hooks to trim a transcript to it
+        # (inference-hooks.yaml); no other pod needs it.
         - name: GUARDRAIL_MAX_REQUEST_BYTES
-          value: {{ (($g).env).maxRequestBytes | default "10485760" | quote }}
+          value: {{ (($g).env).maxRequestBytes | default "67108864" | quote }}
         {{- if eq $s.name "guardrail" }}
         - name: GUARDRAIL_DLP_ADDR
           value: "dlp-scanner:50051"
@@ -165,9 +167,11 @@ spec:
         # helper the container's --served-model-name also uses, so the two
         # cannot drift; it is not a value, because a customer who repointed it
         # would fail every POLICY scan closed. Tuning knobs (per-call timeout,
-        # chunking, concurrency) go in guardrail.policyGuard.env.
+        # chunking, concurrency) go in guardrail.policyGuard.env. https when
+        # vLLM serves TLS (fortiaigate.vllmTls), verified against
+        # FAIG_INTERNAL_TLS_CA_FILE below.
         - name: POLICYGUARD_VLLM_URL
-          value: "http://vllm-server:{{ include "fortiaigate.vllmHTTPPort" $ }}"
+          value: "{{ if include "fortiaigate.vllmTls" $ }}https{{ else }}http{{ end }}://vllm-server:{{ include "fortiaigate.vllmHTTPPort" $ }}"
         - name: POLICYGUARD_VLLM_MODEL
           value: {{ include "fortiaigate.policyGuardModelName" $ | quote }}
         {{- else }}
@@ -207,25 +211,23 @@ spec:
         # the pod's. Two reporters then name the same card; the scraper dedups
         # by uuid and counts one.
         - name: GUARDRAIL_METERING_METRICS_ENDPOINTS
-          value: "{{ if and (($.Values.fortiaigate.gpu).enabled) (gt (int (($.Values.triton).replicas)) 0) }}triton-server-metering:8002{{ end }}"
+          value: "{{ $eps := list }}{{ if and (($.Values.fortiaigate.gpu).enabled) (gt (int (($.Values.triton).replicas)) 0) }}{{ $eps = append $eps "triton-server-metering:8002" }}{{ end }}{{ $eps = concat $eps (get $externalMetering "metricsEndpoints" | default list) }}{{ join "," $eps }}"
         - name: GUARDRAIL_METERING_ENDPOINTS
-          value: "{{ $eps := list }}{{ if and (($.Values.fortiaigate.gpu).enabled) (gt (int (($.Values.triton).replicas)) 0) }}{{ $eps = append $eps "triton-server-metering:9109" }}{{ end }}{{ if include "fortiaigate.vllmEnabled" $ }}{{ $eps = append $eps (printf "vllm-server-metering:%s" (include "fortiaigate.vllmReporterPort" $)) }}{{ end }}{{ join "," $eps }}"
+          value: "{{ $eps := list }}{{ if and (($.Values.fortiaigate.gpu).enabled) (gt (int (($.Values.triton).replicas)) 0) }}{{ $eps = append $eps "triton-server-metering:9109" }}{{ end }}{{ if include "fortiaigate.vllmEnabled" $ }}{{ $eps = append $eps (printf "vllm-server-metering:%s" (include "fortiaigate.vllmReporterPort" $)) }}{{ end }}{{ $eps = concat $eps (get $externalMetering "reporterEndpoints" | default list) }}{{ join "," $eps }}"
         # Both names are headless. Union their addresses so narrowing the
         # metering selector cannot hide a pod still reachable for inference.
         # Meter-only addresses are expected while models are not ready yet.
         - name: GUARDRAIL_METERING_SERVICE_PAIRS
-          value: "{{ $pairs := list }}{{ if and (($.Values.fortiaigate.gpu).enabled) (gt (int (($.Values.triton).replicas)) 0) }}{{ $pairs = append $pairs "triton-server=triton-server-metering" }}{{ end }}{{ if include "fortiaigate.vllmEnabled" $ }}{{ $pairs = append $pairs "vllm-server=vllm-server-metering" }}{{ end }}{{ join "," $pairs }}"
+          value: "{{ $pairs := list }}{{ if and (($.Values.fortiaigate.gpu).enabled) (gt (int (($.Values.triton).replicas)) 0) }}{{ $pairs = append $pairs "triton-server=triton-server-metering" }}{{ end }}{{ if include "fortiaigate.vllmEnabled" $ }}{{ $pairs = append $pairs "vllm-server=vllm-server-metering" }}{{ end }}{{ $pairs = concat $pairs (get $externalMetering "servicePairs" | default list) }}{{ join "," $pairs }}"
         {{- end }}
-        # Per-block scan ceiling, one knob for every component that reads it.
-        # dlp-scanner: truncates GLiNER input to this. policy-guard: truncates
-        # each judged block to this before joining it into the combined text
-        # or cutting it into model windows.
-        # guardrail (dispatcher): uses the SAME number as the per-block
-        # admission charge cap, so a block is charged what will actually be
-        # scanned. All clamp it to the 1.5M hard limit
-        # (go-common/guardrail.HardMaxScanChars).
-        - name: SCANNER_MAX_SCAN_CHARS
-          value: {{ $.Values.guardrail.env.maxScanChars | quote }}
+        {{- if eq $s.name "guardrail" }}
+        # The scan cap in o200k_base tokens (guardrail.env.maxScanTokens): the
+        # most of a block any detector reads, and, 4 bytes a token, the
+        # per-block admission charge. The dispatcher alone reads it; the
+        # scanners keep a fixed ceiling of their own.
+        - name: SCANNER_MAX_SCAN_TOKENS
+          value: {{ $.Values.guardrail.env.maxScanTokens | quote }}
+        {{- end }}
         {{- if ne $s.name "guardrail" }}
         # Scanner detection-cache budget in bytes. Empty = automatic
         # (25% of this container's memory limit). The cache is always capped at
@@ -242,9 +244,36 @@ spec:
         {{- end }}
         {{- if $.Values.tls.enabled }}
         - name: FORTIAIGATE_SSL_CERT_FILE
-          value: {{ printf "%s/tls.crt" $.Values.tls.mountPath | quote }}
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" $) | quote }}
         - name: FORTIAIGATE_SSL_KEY_FILE
-          value: {{ printf "%s/tls.key" $.Values.tls.mountPath | quote }}
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" $) | quote }}
+        # The CA this pod verifies its servers against: the internal
+        # certificate, served by the dispatcher's two backends, by Triton (the
+        # DLP scanner's) and by vLLM (policy-guard's), each name in its SANs.
+        # Under mutual TLS, also the one its own gRPC port verifies clients
+        # against.
+        - name: FAIG_INTERNAL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" $ | quote }}
+        {{- if include "fortiaigate.internalMtls" $ }}
+        # Mutual TLS (tls.mutual): the client certificate this pod presents to
+        # the servers that require one, the internal pair itself
+        - name: FAIG_INTERNAL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" $) | quote }}
+        - name: FAIG_INTERNAL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" $) | quote }}
+        {{- end }}
+        {{- if include "fortiaigate.internalMtls" $ }}
+        # Mutual TLS: the gRPC port (:50051) accepts only a client whose
+        # certificate verifies against the internal certificate. The health
+        # port (:50052) stays plaintext for the kubelet's probes.
+        - name: FAIG_INTERNAL_TLS_CLIENT_AUTH
+          value: "require"
+        {{- end }}
+        {{- if eq $s.name "dlp-scanner" }}
+        # Triton serves gRPC over TLS with tls.enabled (triton-server.yaml).
+        - name: TRITON_TLS
+          value: "true"
+        {{- end }}
         {{- end }}
         {{- /* per-component extra env (e.g. dlp-scanner CHUNK_SIZE / CHUNK_OVERLAP_SIZE).
                The dispatcher's two GPU queue sizes are rendered above, from
@@ -260,7 +289,7 @@ spec:
         {{- if $.Values.tls.enabled }}
         volumeMounts:
         - name: tls-certs
-          mountPath: {{ $.Values.tls.mountPath | quote }}
+          mountPath: {{ (include "fortiaigate.internalTlsMountPath" $) | quote }}
           readOnly: true
         {{- end }}
       {{- if $.Values.tls.enabled }}

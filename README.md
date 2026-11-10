@@ -1,12 +1,12 @@
 # FortiAIGate on AWS EKS
 
-Deploy FortiAIGate 8.0.2 build0055 with Terraform and the bundled Helm chart. The stack creates a VPC, EKS cluster, EFS storage, application nodes, an optional GPU node, and an AWS Load Balancer Controller for ALB ingress.
+Deploy FortiAIGate 8.0.3 build 6207 with Terraform and the bundled Helm chart. The stack creates a VPC, EKS cluster, EFS storage, application nodes, an optional GPU node, and an AWS Load Balancer Controller for ALB ingress.
 
 ## Before you start
 
 - Install Terraform 1.9+, AWS CLI v2, Helm 3, and kubectl compatible with your cluster version (default: 1.31). Check the [EKS version support note](docs/deployment-guide.md#eks-version-support) before creating a cluster.
 - Configure AWS credentials with permission to create VPC, EKS, EC2, EFS, and IAM resources. This deployment creates billable AWS resources, including GPU instances when enabled.
-- Obtain the entitled FortiAIGate images and a deployment license from Fortinet. [Push the required images to your registry](docs/images.md) before applying.
+- Obtain the entitled FortiAIGate images and a deployment license from Fortinet. [Mirror the build 6207 images to ECR](docs/images-build6207.md) before applying. For existing releases, follow the [8.0.3 upgrade steps](docs/deployment-guide.md#upgrading-to-803-build-6207).
 - [Create an S3 state bucket and DynamoDB lock table](docs/remote-state.md) once for your account.
 - For the public HTTPS quickstart below, have a hostname and an ACM certificate covering it in the deployment region, plus access to update DNS. GPU inference also needs sufficient EC2 GPU quota and available capacity.
 

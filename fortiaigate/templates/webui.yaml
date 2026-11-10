@@ -18,9 +18,8 @@ spec:
   template:
     metadata:
       annotations:
-        checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
         # This is the key that triggers a restart when TLS certificates change
-        checksum/config: {{ printf "%s%s" (tpl (.Files.Get .Values.tls.cert) $) (tpl (.Files.Get .Values.tls.key) $) | sha256sum }}
+        checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
       labels:
         app: webui
     spec:
@@ -47,7 +46,10 @@ spec:
           capabilities:
             drop:
             - ALL
-        command: ["node", "https-server.js"]
+        # No command: the 8.0.3 console (fortiaigate-fe) is nginx on its stock
+        # entrypoint. Its listen script serves HTTPS on :3000 when both
+        # FORTIAIGATE_SSL_* below are set, and writes only /tmp, so it runs as
+        # uid 10001.
         ports:
         - containerPort: 3000
         resources:
@@ -86,10 +88,15 @@ apiVersion: v1
 kind: Service
 metadata:
   name: webui
-  {{- if eq .Values.ingress.className "alb" }}
+  {{- if eq (include "fortiaigate.ingressController" .) "alb" }}
   annotations:
     alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.ingress.healthcheck.webui | quote }}
     alb.ingress.kubernetes.io/success-codes: "200"
+  {{- else }}
+  {{- with include "fortiaigate.traefikBackendAnnotations" . }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
   {{- end }}
   labels:
     app.kubernetes.io/name: fortiaigate

@@ -1,0 +1,41 @@
+{{- if and .Values.auth.enabled (ne (include "fortiaigate.ingressController" .) "alb") }}
+{{- range $name, $entry := include "fortiaigate.authIngressRoutes" . | fromJson }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: fortiaigate-auth-{{ $name }}
+  {{- if eq (include "fortiaigate.ingressController" $) "nginx" }}
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: {{ $entry.protocol | quote }}
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "64m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+  {{- end }}
+spec:
+  {{- with $.Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if $.Values.tls.enabled }}
+  tls:
+  - secretName: {{ include "fortiaigate.tlsSecretName" $ }}
+    {{- if $.Values.ingress.host }}
+    hosts: [{{ $.Values.ingress.host | quote }}]
+    {{- end }}
+  {{- end }}
+  rules:
+  - {{- if $.Values.ingress.host }}
+    host: {{ $.Values.ingress.host | quote }}
+    {{- end }}
+    http:
+      paths:
+      {{- range $path := $entry.paths }}
+      - path: {{ $path }}
+        pathType: Prefix
+        backend:
+          service:
+            name: {{ if eq $name "scim" }}auth-scim{{ else }}auth{{ end }}
+            port: {number: {{ $entry.port }}}
+      {{- end }}
+{{- end }}
+{{- end }}
