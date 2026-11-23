@@ -212,10 +212,10 @@ spec:
         - name: FAIG_INTERNAL_TLS_KEY_FILE
           value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
         {{- end }}
-        # The guardrail's scan cap, in tokens: /scan2 tells a FortiGate the
-        # longest text it takes in characters, 4 a token (max_scan_len).
-        - name: SCANNER_MAX_SCAN_TOKENS
-          value: {{ .Values.guardrail.env.maxScanTokens | quote }}
+        # The guardrail's scan cap, which /scan2 tells a FortiGate in
+        # characters (max_scan_len, 4 a token), is the Maximum scan size on
+        # Settings › System Settings since 8.0.3, carried on the fabric
+        # snapshot: no SCANNER_MAX_SCAN_TOKENS here.
         {{- if (($f.resources).limits).memory }}
         # GOMEMLIMIT follows this container's limit (9/10 of it), as
         # llm-gateway's does. Guarded on the limit existing: without one,
@@ -299,9 +299,22 @@ spec:
         - name: FABRIC_INSTREAM_HOLDBACK_CHARS
           value: {{ . | quote }}
         {{- end }}
-        {{- range $k, $v := $f.env }}
-        - name: {{ $k }}
-          value: {{ $v | quote }}
+        {{- /* The rest, from fabric.env: a name set above in any mode is
+               refused (fortiaigate.extraEnv, Mantis 1354184), those of the
+               values beside it (orgId, goMemLimit, inStream.*) even where
+               they are empty: the message names the value to set instead. */}}
+        {{- $owned := list "FORTIAIGATE_LOG_LEVEL" "FABRIC_LISTEN_ADDR" "FABRIC_TLS_CERT_FILE"
+          "FABRIC_TLS_KEY_FILE" "FABRIC_MTLS_BIND_SERIAL" "FABRIC_ORG_ID" "FABRIC_LICENSE_URL"
+          "FAIG_GUARDRAIL_ADDR" "FAIG_GUARDRAIL_TLS" "FAIG_GUARDRAIL_TLS_CA_FILE"
+          "FAIG_GUARDRAIL_TLS_CERT_FILE" "FAIG_GUARDRAIL_TLS_KEY_FILE" "FAIG_INTERNAL_TLS_CA_FILE"
+          "FAIG_INTERNAL_TLS_CERT_FILE" "FAIG_INTERNAL_TLS_KEY_FILE" "FAIG_MEMORY_LIMIT_BYTES"
+          "GOMEMLIMIT" "POSTGRES_USER" "POSTGRES_PASSWORD" "POSTGRES_DB" "POSTGRES_HOST"
+          "POSTGRES_PORT" "POSTGRES_SSL_ENABLED" "POSTGRES_SSL_CA_CERTS" "POSTGRES_SSL_VERIFY"
+          "POSTGRES_SSL_CERTFILE" "POSTGRES_SSL_KEYFILE" "REDIS_SSL_ENABLED" "REDIS_SSL_CERTFILE"
+          "REDIS_SSL_KEYFILE" "REDIS_SSL_CA_CERTS" "REDIS_SSL_VERIFY" "REDIS_HOST" "REDIS_PORT"
+          "REDIS_PASSWORD" "FABRIC_INSTREAM_WINDOW_CHARS" "FABRIC_INSTREAM_HOLDBACK_CHARS" }}
+        {{- with (include "fortiaigate.extraEnv" (dict "env" $f.env "path" "fabric.env" "owned" $owned) | trim) }}
+        {{- . | nindent 8 }}
         {{- end }}
         volumeMounts:
         - name: fabric-tls

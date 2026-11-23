@@ -41,17 +41,18 @@ If stage 1 fails or nodes are not Ready, fix it before stage 2. If VPC creation 
 
 Subsequent configuration changes normally use a full `terraform plan` and `terraform apply` with the same variable file. Targeting is reserved for this bootstrap and the [staged teardown](teardown.md). A healthy EKS bootstrap does not establish application readiness or validate the full teardown; verify each stage separately.
 
-## Upgrading to 8.0.3 build 6207
+## Upgrading to 8.0.3 build 6220
 
-Use `v803` for this upgrade and keep the existing release name, namespace, and state backend. The `main` branch deploys 8.0.2 build 0055.
+Use `v803` and keep the existing release name, namespace, and state backend. The `main` branch deploys 8.0.2 build 0055.
 
-1. Back up PostgreSQL, Redis, EFS, Helm values, and the application Secrets, especially the master key. Rehearse the upgrade against a restored copy before upgrading a production release.
-2. [Stage build 6207 images](images-build6207.md) and update your existing deployment tfvars. Set `image_repository` to your ECR prefix ending in `/fortiaigate-v803` and `image_tag = "V8.0.3-build6207"`. Review Helm overrides in `extra_values_files` against the new chart values. For example, the LLM streaming options now use `windowChars` and `holdbackChars`.
-3. Run a full `terraform plan` with the same tfvars and check that the VPC, EKS, node groups, EFS, and Kubernetes TLS Secret names are retained. Terraform will reissue the internal leaf certificate to add DNS names for the new services and the loopback IP used by the vLLM health checks. Expect application and database pod rollouts.
-4. Apply after reviewing the plan. The Helm pre-upgrade job checks PostgreSQL before Helm changes release workloads. If it fails, check `kubectl -n <namespace> logs job/fortiaigate-schema-preflight`. If it reports a required schema bridge, obtain the supported migration procedure from Fortinet before retrying. Keep the preflight enabled.
-5. Verify WebUI login, API and gateway access, healthy ALB targets, and a policy-enforced LLM request. On GPU deployments, check both inference engines. After the first deployment, back up the Auth identity and internal token Secrets alongside the master key.
+1. Back up PostgreSQL, Redis, EFS, Helm values, and the application Secrets, especially the master key, internal token, and Auth identity. Rehearse the upgrade against a restored copy before upgrading a production release.
+2. [Stage build 6220 images](images-build6220.md) and set `image_tag = "V8.0.3-build6220"` and `image_repository` to your ECR prefix ending in `/fortiaigate-v803`. For either ALB exposure mode, set the same-region ACM ARN for `ingress_host` and allow the chart's TLS 1.3 listener policy. Update prior HTTP-only listener overrides. [Ingress and TLS](ingress-and-tls.md)
+3. Review `extra_values_files` against the [chart values](../fortiaigate/values.yaml). If you previously enabled `inferenceHooks`, remove that override and account for the retired endpoint in any integration using it. Build 6220 also retires the MCP stdio runner. Provider timeouts and TLS verification, MCP server TLS verification, and guardrail scan limits are now set in the console. Auth is always deployed.
+4. Run a full `terraform plan` with the same tfvars and confirm that the VPC, EKS, node groups, EFS, and Kubernetes TLS Secret names are retained. Expect application and PostgreSQL rollouts. A first upgrade from 8.0.2 can also reissue the internal certificate to cover new service names.
+5. Apply after reviewing the plan. The Helm pre-upgrade job checks PostgreSQL before Helm changes release workloads. If it fails, check `kubectl -n <namespace> logs job/fortiaigate-schema-preflight`. If it reports a required schema bridge, obtain the supported migration procedure from Fortinet before retrying.
+6. Verify WebUI login, API and gateway access, healthy ALB targets, and a policy-enforced LLM request. Verify OAuth and SCIM if configured. On GPU deployments, check both inference engines.
 
-On ALB, Auth and plugin routes share the existing listener and the same ACM and exposure settings. If you enable inference hooks, configure `inferenceHooks.ingress.sourceRanges` to restrict that route by source IP. Use `ingress.annotations` for shared ALB settings. Keep the ALB frontend on HTTPS for browser and identity-provider flows.
+Build 6220 adds the managed-device endpoint at `/plugin/device`. A fresh install provisions the device workload identity with Auth. An existing Auth bundle that lacks the device identity keeps its existing key material, and managed devices use the organization device key without user sign-in. To enable user sign-in on such an upgrade, configure `deviceAdapter.workloadTlsSecretName` with a workload certificate from the existing Auth issuer for `spiffe://faig/deployment/device-adapter`. Set `deviceAdapter.enabled: false` to omit the sidecar and route.
 
 ## License management
 
@@ -115,8 +116,8 @@ kubectl describe node -l fortiaigate-role=gpu | grep -A10 "Capacity:"
 | Class | Use when | ACM cert? | Route 53? |
 |-------|----------|-----------|-----------|
 | `nginx` | nginx-ingress-controller already in the cluster | No | Optional |
-| `alb` (`internal = true`) | All traffic enters via VPN/Direct Connect/Transit Gateway/FortiGate | For HTTPS | Optional private DNS |
-| `alb` (`internal = false`) | Public internet | For HTTPS, same region as `aws_region` | Optional DNS provider |
+| `alb` (`internal = true`) | All traffic enters via VPN/Direct Connect/Transit Gateway/FortiGate | Required, same region as `aws_region` | Private DNS for the certificate hostname |
+| `alb` (`internal = false`) | Public internet | Required, same region as `aws_region` | DNS for the certificate hostname |
 
 The AWS Load Balancer Controller is installed automatically when `ingress_class = "alb"` and `aws_load_balancer_controller_enabled = true` (the default). Set `aws_load_balancer_controller_enabled = false` if a controller is already managed elsewhere.
 

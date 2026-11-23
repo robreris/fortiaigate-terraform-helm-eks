@@ -132,7 +132,7 @@ spec:
             secretKeyRef:
               name: {{ .Release.Name }}-postgresql
               key: password
-        # observability.env sets the session pool's Helm defaults to 25/10.
+        # observability.env sets the session pool's Helm defaults to 15/5.
         # Retain the 10/5 fallback when either key is absent.
         {{- $obsEnv := .Values.observability.env | default dict }}
         {{- if not (hasKey $obsEnv "DB_POOL_SIZE") }}
@@ -197,10 +197,17 @@ spec:
         - name: REDIS_SSL_CA_CERTS
           value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
         {{- end }}
-        # ---- the rest, verbatim from values ----------------------------------
-        {{- range $k, $v := .Values.observability.env }}
-        - name: {{ $k }}
-          value: {{ $v | quote }}
+        # ---- the rest, from observability.env --------------------------------
+        {{- /* A name set above in any mode is refused (fortiaigate.extraEnv,
+               Mantis 1354184); DB_POOL_SIZE and DB_MAX_OVERFLOW are the map's
+               when it has them. */}}
+        {{- $owned := list "FAIG_INTERNAL_TLS_CA_FILE" "FAIG_INTERNAL_TLS_CLIENT_AUTH"
+          "FORTIAIGATE_SSL_CERT_FILE" "FORTIAIGATE_SSL_KEY_FILE" "FAIG_MCP_ADMISSION_KEY" "LOG_LEVEL"
+          "POSTGRES_PASSWORD" "FAIG_DATABASE_URL" "REDIS_PASSWORD" "REDIS_URL" "REDIS_CLUSTER"
+          "REDIS_HOST" "REDIS_PORT" "REDIS_SSL_VERIFY" "REDIS_SSL_ENABLED" "REDIS_SSL_CERTFILE"
+          "REDIS_SSL_KEYFILE" "REDIS_SSL_CA_CERTS" }}
+        {{- with (include "fortiaigate.extraEnv" (dict "env" .Values.observability.env "path" "observability.env" "owned" $owned) | trim) }}
+        {{- . | nindent 8 }}
         {{- end }}
         volumeMounts:
         # Writable scratch for WeasyPrint / matplotlib / fontconfig caches —
@@ -242,9 +249,9 @@ spec:
   # reachable from outside the cluster. Re-check if an ingress rule is ever
   # added.
   #
-  # The name and port are what mcp-gateway's, plugin-adapter's and
-  # inference-hooks' OBSERVABILITY_URL expect (https with tls.enabled). The
-  # port keeps the name http with tls.enabled.
+  # The name and port are what mcp-gateway's and plugin-adapter's
+  # OBSERVABILITY_URL expect (https with tls.enabled). The port keeps the name
+  # http with tls.enabled.
   type: ClusterIP
   selector:
     app: observability

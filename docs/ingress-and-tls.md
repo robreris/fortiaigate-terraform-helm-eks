@@ -15,7 +15,7 @@ This EKS implementation follows the sister AKS repo's separation of web TLS and 
 
 `internal` controls exposure. Conflicting `alb.ingress.kubernetes.io/scheme` values in `ingress_annotations` fail with an explanatory error. Terraform's exposure values also take precedence over `extra_values_files`.
 
-Use an ACM certificate for browser/API HTTPS in either mode:
+Both ALB exposure modes require an ACM certificate for HTTPS.
 
 ```hcl
 ingress_class       = "alb"
@@ -27,7 +27,7 @@ aws_region          = "us-west-2"
 
 This selects an HTTPS listener on 443. Existing `ingress_annotations` containing `alb.ingress.kubernetes.io/certificate-arn` remain supported; the dedicated variable takes precedence. The ACM certificate must cover `ingress_host`. An imported corporate certificate can be used in ACM; clients must trust its issuer. PEM files supplied to Kubernetes do not configure the ALB listener.
 
-Without an ACM ARN, Terraform explicitly selects HTTP on 80. This is an evaluation mode: browser-to-ALB traffic is plaintext. Use ACM and HTTPS for normal console/API testing, including workflows that require secure cookies. Pod/backend TLS remains enabled. The chart omits Ingress `spec.tls` for ALB so a generated pod certificate or placeholder hostname cannot unintentionally drive frontend ACM discovery.
+Terraform requires an ACM ARN. The ALB uses a TLS 1.3 listener policy so it can negotiate TLS 1.3 with the Auth SCIM backend. The default policy is `ELBSecurityPolicy-TLS13-1-2-2021-06`. The ALB ingress omits `spec.tls` and uses the configured ACM certificate. [AWS ALB security policies](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/describe-ssl-policies.html)
 
 For custom HTTP-to-HTTPS redirection with an ACM certificate, set both listeners and the redirect annotation:
 
@@ -38,7 +38,7 @@ ingress_annotations = {
 }
 ```
 
-The controller merges these settings with target type `ip` and HTTPS backend/health-check protocols. Each backend Service defines its own health path: API `/openapi.json`, WebUI `/ui`, gateway `/fortiaigate/health/readiness`. Override `ingress.healthcheck` in an extra values file if a later application build changes these endpoints. Service-level annotations override an Ingress-level health path.
+The chart sets IP targets, HTTPS backend connections, and HTTPS checks on each routed Service port. Auth serves OAuth and SCIM through different ports on one Service, with `/healthz` on both. The API uses `/api/healthz`, the WebUI uses `/ui/`, and the LLM gateway uses `/fortiaigate/health/readiness`. Override those three paths with `ingress.healthcheck` in an extra values file.
 
 AWS references: [controller annotations and precedence](https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/guide/ingress/annotations/) and [ALB target groups](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-target-groups.html). ALB encrypts HTTPS backend traffic without validating target certificates; the AKS Application Gateway private-root upload is therefore unnecessary here.
 
@@ -46,7 +46,7 @@ AWS references: [controller annotations and precedence](https://kubernetes-sigs.
 
 Terraform creates a per-deployment CA and a serving certificate covering the ingress host, localhost, and the web-facing Kubernetes Service DNS names. It creates two Secrets:
 
-- `fortiaigate-tls-secret`: API, LLM gateway, WebUI, and the nginx frontend.
+- `fortiaigate-tls-secret`: Auth public listeners, API, gateways, plugin adapters, WebUI, and the nginx frontend.
 - `fortiaigate-internal-tls-secret`: guardrail services, LogD, license manager, PostgreSQL, Redis, and database client mounts. Its `ca.crt` is the generated CA.
 
 The Secrets use separate keys and leaf certificates signed by the same generated CA. The internal certificate's common name matches `postgresql.auth.username` (default `fortiaigate_postgres_user`), including overrides from `extra_values_files`, because PostgreSQL uses certificate authentication. Its DNS SANs cover the same service names for server verification. Database clients, including the license manager, receive explicit certificate, key, and CA paths. Changing the ingress hostname does not change the database identity.
@@ -73,7 +73,7 @@ python3 scripts/check_tls.py \
 
 For nginx, that web Secret is also the frontend certificate. For ALB, configure ACM separately. This repo does not install cert-manager or copy the AKS Azure DNS-01 integration.
 
-Replacing supplied web certificate files and applying rolls API, gateway, and WebUI. Internal service/database certificates and their checksums remain independent. Export public CA material with `terraform output -raw tls_ca_certificate` or `terraform output -raw internal_tls_ca_certificate`. Serving keys reside in Terraform state; use the protected remote backend and keep PEM inputs out of Git.
+Replacing supplied web certificate files and applying rolls Auth and the other workloads that serve the web certificate. Internal service/database certificates and their checksums remain independent. Export public CA material with `terraform output -raw tls_ca_certificate` or `terraform output -raw internal_tls_ca_certificate`. Serving keys reside in Terraform state; use the protected remote backend and keep PEM inputs out of Git.
 
 For an existing deployment, the new generated CA and separate internal Secret change database/server trust. Schedule a rollout window and back up data before applying. The namespace, web Secret, and existing serving private-key resource addresses remain stable. Changing web certificate sources later retains the internal CA.
 
@@ -91,7 +91,7 @@ kubectl describe ingress fortiaigate-ingress -n fortiaigate
 kubectl logs -n kube-system deployment/aws-load-balancer-controller --tail=100
 ```
 
-Point `ingress_host` to the ALB hostname in the DNS clients use. Private DNS must resolve from the connected network; this stack does not create VPN/peering connectivity or DNS records. ALB addresses can change; use aliases or CNAMEs rather than pinning the resolved IPs. Verify `/ui`, authenticated API calls, and inference from a client on the correct network. Check target-group health for all three backends in AWS.
+Point `ingress_host` to the ALB hostname in the DNS clients use. Private DNS must resolve from the connected network; this stack does not create VPN/peering connectivity or DNS records. ALB addresses can change; use aliases or CNAMEs rather than pinning the resolved IPs. Verify `/ui`, authenticated API calls, and inference from a client on the correct network. Check target-group health for all routed backends in AWS.
 
 For access before ingress/DNS is ready, `node scripts/ui-proxy.mjs` creates local port-forwards and serves the UI, API, and `/ai` on one HTTPS origin. It uses your current kubeconfig, binds to localhost, and does not test ALB reachability or DNS. It requires Node.js and OpenSSL; open `https://localhost:8443/ui` and trust its local self-signed certificate for evaluation. Export `FAIG_NAMESPACE` to select a different namespace.
 

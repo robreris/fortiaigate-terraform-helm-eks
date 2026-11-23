@@ -23,7 +23,7 @@ spec:
       annotations:
         # Restart the pod when a TLS certificate changes: the external one it
         # serves, or the chart-generated internal one it trusts as a client
-        checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
+        checksum/tls: {{ include "fortiaigate.externalTlsChecksum" . | quote }}
         {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
         checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
         {{- end }}
@@ -80,8 +80,9 @@ spec:
           {{- toYaml .Values.api.resources | nindent 10 }}
         # Environment variables
         env:
-        # Keep provider health probes consistent with the LLM gateway.
-        - {name: UPSTREAM_TLS_VERIFY, value: {{ .Values.llmGateway.env.upstreamTls.verify | quote }}}
+        # Check Health of a model verifies TLS as its AI provider's Connection
+        # settings say (Models › AI Providers), as the LLM gateway does: no
+        # UPSTREAM_TLS_VERIFY here since 8.0.3.
         - name: FORTIAIGATE_LOG_LEVEL
           value: {{ .Values.fortiaigate.env.logLevel | quote }}
         # Failure-policy pins (fortiaigate.failurePolicy.*, #91): rendered only
@@ -110,7 +111,12 @@ spec:
         - name: FORTIAIGATE_EXTERNAL_URL
           value: {{ $ssoExternal | quote }}
         {{- end }}
-        {{- if .Values.auth.enabled }}
+        # Whether device-adapter (managed devices) is deployed: without it
+        # the Deployment page says what to turn on instead of only offering
+        # an install command nothing serves (agentguard.DeviceAdapterFromEnv).
+        - name: FAIG_DEVICE_ADAPTER_ENABLED
+          value: {{ ternary "true" "false" (eq (include "fortiaigate.deviceAdapterOn" .) "true") | quote }}
+
         - name: FAIG_AUTH_URL
           value: https://auth:9000
         - name: FAIG_AUTH_WORKLOAD_CERT_FILE
@@ -123,7 +129,7 @@ spec:
         # including a supported custom workload Secret/identity pair.
         - name: FAIG_MCP_AUTH_WORKLOAD_URIS
           value: {{ list .Values.auth.mcpWorkloadIdentity | toJson | quote }}
-        {{- end }}
+
         - name: CSRF_SECRET_KEY
           {{- if .Values.fortiaigate.env.csrfSecretKey }}
           value: {{ .Values.fortiaigate.env.csrfSecretKey | quote }}
@@ -230,11 +236,11 @@ spec:
             drop:
               - ALL
         volumeMounts:
-        {{- if .Values.auth.enabled }}
+
         - name: auth-workload
           mountPath: /var/run/faig-auth
           readOnly: true
-        {{- end }}
+
         - name: shared-data
           mountPath: /etc/fortiaigate/
           readOnly: false
@@ -251,13 +257,13 @@ spec:
           readOnly: true
         {{- end }}
       volumes:
-      {{- if .Values.auth.enabled }}
+
       - name: auth-workload
         secret:
           secretName: {{ include "fortiaigate.authSecret" (dict "root" . "override" .Values.auth.apiWorkloadSecretName) | quote }}
           {{- include "fortiaigate.authSecretItems" (dict "component" "api" "override" .Values.auth.apiWorkloadSecretName) | nindent 10 }}
           defaultMode: 0440
-      {{- end }}
+
       - name: shared-data
         persistentVolumeClaim:
           claimName: {{ include "fortiaigate.fullname" . }}-storage
@@ -282,15 +288,9 @@ apiVersion: v1
 kind: Service
 metadata:
   name: api
-  {{- if eq (include "fortiaigate.ingressController" .) "alb" }}
-  annotations:
-    alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.ingress.healthcheck.api | quote }}
-    alb.ingress.kubernetes.io/success-codes: "200"
-  {{- else }}
-  {{- with include "fortiaigate.traefikBackendAnnotations" . }}
+  {{- with include "fortiaigate.publicBackendAnnotations" (dict "root" . "path" .Values.ingress.healthcheck.api) }}
   annotations:
     {{- . | nindent 4 }}
-  {{- end }}
   {{- end }}
   labels:
     app: api

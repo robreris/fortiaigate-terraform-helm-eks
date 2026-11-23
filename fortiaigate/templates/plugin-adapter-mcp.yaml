@@ -26,22 +26,14 @@ the plugin cannot read. */ -}}
 {{- fail (printf "guardrail.env.maxRequestBytes=%d: with pluginAdapterMcp, at most 12533760 (plugin-adapter's body limit, the scan in base64 and 64 KiB, must stay within plugin-adapter-mcp's 16 MiB)" $scan) }}
 {{- end }}
 {{- $managed := ne (toString (.Values.pluginAdapter).legacyDevAuth) "true" }}
-{{- if and $managed (not $.Values.auth.enabled) (not $gs.workloadTlsSecretName) }}
-{{- fail "managed AgentGuard requires pluginAdapterMcp.workloadTlsSecretName: the Auth workload certificate plugin-adapter resolves employee tokens with" }}
-{{- end }}
+
 apiVersion: v1
 kind: Service
 metadata:
   name: plugin-adapter-mcp
-  {{- if eq (include "fortiaigate.ingressController" .) "alb" }}
-  annotations:
-    alb.ingress.kubernetes.io/healthcheck-path: "/api/v1/plugins/health/readiness"
-    alb.ingress.kubernetes.io/success-codes: "200"
-  {{- else }}
-  {{- with include "fortiaigate.traefikBackendAnnotations" . }}
+  {{- with include "fortiaigate.publicBackendAnnotations" (dict "root" . "path" "/api/v1/plugins/health/readiness") }}
   annotations:
     {{- . | nindent 4 }}
-  {{- end }}
   {{- end }}
   labels:
     app.kubernetes.io/name: fortiaigate

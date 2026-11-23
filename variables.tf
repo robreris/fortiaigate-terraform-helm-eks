@@ -128,7 +128,7 @@ variable "image_repository" {
 variable "image_tag" {
   description = "Image tag for all FortiAIGate service images"
   type        = string
-  default     = "V8.0.3-build6207"
+  default     = "V8.0.3-build6220"
 }
 
 variable "namespace" {
@@ -229,7 +229,7 @@ variable "internal" {
 }
 
 variable "acm_certificate_arn" {
-  description = "Existing ACM certificate ARN for ALB frontend HTTPS, in aws_region. Works for public and internal ALBs. Empty keeps HTTP unless certificate-arn is supplied through ingress_annotations."
+  description = "Same-region ACM certificate ARN required for public and internal ALBs. May also be provided through the certificate-arn ingress annotation."
   type        = string
   default     = ""
 

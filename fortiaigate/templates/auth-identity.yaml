@@ -1,4 +1,4 @@
-{{- if and .Values.auth.enabled .Values.auth.autoProvision }}
+{{- if .Values.auth.autoProvision }}
 {{- $name := include "fortiaigate.authIdentityName" . }}
 apiVersion: v1
 kind: ServiceAccount

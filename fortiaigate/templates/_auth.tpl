@@ -29,6 +29,30 @@ items:
 {{- end }}
 {{- end -}}
 
-{{- define "fortiaigate.authIngressRoutes" -}}
-{{- dict "oauth" (dict "port" 9002 "protocol" "HTTP" "paths" (list "/oauth" "/.well-known/oauth-authorization-server/oauth" "/.well-known/openid-configuration/oauth" "/api/auth/sso/oidc/callback")) "scim" (dict "port" 9444 "protocol" "HTTPS" "paths" (list "/scim/v2" "/api/v1/scim")) | toJson -}}
-{{- end }}
+{{/* Whether device-adapter (managed devices) runs: deviceAdapter.enabled,
+its default, with managed AgentGuard. Development mode
+(pluginAdapter.legacyDevAuth) sets no internal token to sign its device
+admissions with, so it is left out there. "true" or empty. */}}
+{{- define "fortiaigate.deviceAdapterOn" -}}
+{{- if and (eq (toString (.Values.deviceAdapter).enabled) "true") (ne (toString (.Values.pluginAdapter).legacyDevAuth) "true") -}}true{{- end -}}
+{{- end -}}
+
+{{/* Whether device-adapter gets its own Auth workload identity, with which it
+resolves the device users' sign-ins: a Secret named for it
+(deviceAdapter.workloadTlsSecretName), or the bundled Auth's identity bundle
+when that bundle has it. A bundle made before device-adapter had an identity
+(2026-11-02) has no device-tls.crt, and an automatic one is never rewritten:
+mounting it would keep the whole plugin-adapter pod from starting, so
+device-adapter runs without sign-in there (NOTES.txt says so), as it does
+with a manually provided bundle without a device identity. A render with no
+cluster (helm template) sees no bundle and takes the new one, which has it.
+"true" or empty. */}}
+{{- define "fortiaigate.deviceAdapterAuth" -}}
+{{- if include "fortiaigate.deviceAdapterOn" . -}}
+{{- if (.Values.deviceAdapter).workloadTlsSecretName -}}true
+{{- else if .Values.auth.autoProvision -}}
+{{- $bundle := (lookup "v1" "Secret" .Release.Namespace (include "fortiaigate.authIdentityName" .)) | default dict -}}
+{{- if or (not $bundle) (hasKey ($bundle.data | default dict) "device-tls.crt") -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

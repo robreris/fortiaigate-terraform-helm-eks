@@ -14,7 +14,7 @@ image_repository = "<account-id>.dkr.ecr.<region>.amazonaws.com/fortiaigate-v803
 
 aws_region   = "us-east-1"
 cluster_name = "fortiaigate-prod"
-image_tag    = "V8.0.3-build6207"
+image_tag    = "V8.0.3-build6220"
 
 # ---------------------------------------------------------------------------
 # GPU support

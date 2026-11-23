@@ -16,20 +16,34 @@ CLOSED (gateway 503) rather than silently passing.
 {{- $tag := (.Values.guardrail).tag | default .Values.fortiaigate.image.tag -}}
 {{- $g := .Values.guardrail | default dict -}}
 {{- $externalMetering := $g.externalMetering | default dict -}}
-{{- /* Traffic-normalization DECODE policy (values.yaml
-       guardrail.trafficNormalization.decode), rendered onto the dispatcher only
-       — it is the pod that runs the stage. `default` is unusable for the
-       boolean here (Helm treats false as empty, so `false | default true`
-       yields true); `dig` keeps an explicit false.
-
-       There is no character-screening variable: that half of the stage is
-       per-guardrail policy, carried on each scan request, and no deployment
-       setting can turn it on or off. */ -}}
-{{- $tnDecode := ((.Values.guardrail).trafficNormalization).decode | default dict -}}
+{{- /* The scan time limit, the scan cap and the decoding of encoded content
+       are the deployment's System Settings (Settings › System Settings),
+       which every caller puts on each scan request: no pod gets a variable
+       for them since 8.0.3, and the dispatcher's env map below does not
+       pass on the GUARDRAIL_SCAN_BUDGET_SECONDS an old values file still
+       carries (NOTES.txt names it), and the scanners' maps do not pass on
+       SCANNER_MAX_SCAN_CHARS, retired on 2026-11-05. */ -}}
+{{- /* Each component's `env:` map (fortiaigate.extraEnv, Mantis 1354184):
+       `owned` is every name the chart may set in that container, refused
+       there whatever this render sets (vLLM's URL and model name included
+       where vLLM is off); `skip` is rendered above with the map's value
+       first (the queue sizes, SCANNER_CACHE_MAX_BYTES) or retired. */ -}}
+{{- $owned := list "FORTIAIGATE_LOG_LEVEL" "GUARDRAIL_MAX_REQUEST_BYTES"
+  "FORTIAIGATE_SSL_CERT_FILE" "FORTIAIGATE_SSL_KEY_FILE" "FAIG_INTERNAL_TLS_CA_FILE"
+  "FAIG_INTERNAL_TLS_CERT_FILE" "FAIG_INTERNAL_TLS_KEY_FILE" "FAIG_INTERNAL_TLS_CLIENT_AUTH" -}}
 {{- $svcs := list
-  (dict "name" "guardrail"    "img" "guardrail"         "cmd" "/app/guardrail"    "cfg" ($g.guardrail  | default dict))
-  (dict "name" "dlp-scanner"  "img" "guardrail-scanner" "cmd" "/app/dlp-scanner"  "cfg" ($g.dlpScanner | default dict))
-  (dict "name" "policy-guard" "img" "guardrail-scanner" "cmd" "/app/policy-guard" "cfg" ($g.policyGuard | default dict))
+  (dict "name" "guardrail"    "img" "guardrail"         "cmd" "/app/guardrail"    "key" "guardrail"   "cfg" ($g.guardrail  | default dict)
+        "owned" (concat $owned (list "GUARDRAIL_DLP_ADDR" "GUARDRAIL_POLICY_ADDR" "GUARDRAIL_POOL_VERSION"
+          "FAIG_MASTER_KEY" "GUARDRAIL_SHORT_CIRCUIT_DEFAULT" "GUARDRAIL_METERING_METRICS_ENDPOINTS"
+          "GUARDRAIL_METERING_ENDPOINTS" "GUARDRAIL_METERING_SERVICE_PAIRS"))
+        "skip" (list "GUARDRAIL_DLP_QUEUE_CHARS" "GUARDRAIL_POLICY_QUEUE_CHARS" "GUARDRAIL_SCAN_BUDGET_SECONDS"))
+  (dict "name" "dlp-scanner"  "img" "guardrail-scanner" "cmd" "/app/dlp-scanner"  "key" "dlpScanner"  "cfg" ($g.dlpScanner | default dict)
+        "owned" (concat $owned (list "TRITON_TLS"))
+        "skip" (list "SCANNER_CACHE_MAX_BYTES" "SCANNER_MAX_SCAN_CHARS"))
+  (dict "name" "policy-guard" "img" "guardrail-scanner" "cmd" "/app/policy-guard" "key" "policyGuard" "cfg" ($g.policyGuard | default dict)
+        "owned" (concat $owned (list "POLICYGUARD_VLLM_URL" "POLICYGUARD_VLLM_MODEL"
+          "POLICYGUARD_VLLM_PROMPT_TOKENS_DETAILS" "POLICYGUARD_STUB"))
+        "skip" (list "SCANNER_CACHE_MAX_BYTES" "SCANNER_MAX_SCAN_CHARS"))
 }}
 {{- range $s := $svcs }}
 apiVersion: apps/v1
@@ -103,8 +117,7 @@ spec:
         # and replies are never size-capped, so oversized rewritten results
         # still flow back); also what ListCapabilities advertises. The plugin
         # adapter reads the same value to size its body limit
-        # (plugin-adapter.yaml), and inference-hooks to trim a transcript to it
-        # (inference-hooks.yaml); no other pod needs it.
+        # (plugin-adapter.yaml); no other pod needs it.
         - name: GUARDRAIL_MAX_REQUEST_BYTES
           value: {{ (($g).env).maxRequestBytes | default "67108864" | quote }}
         {{- if eq $s.name "guardrail" }}
@@ -132,13 +145,6 @@ spec:
             secretKeyRef:
               name: {{ include "fortiaigate.masterKeySecretName" $ }}
               key: master-key
-        # Traffic normalization, decode half: the pre-detector stage that peels
-        # base64 / percent / \uXXXX / \xXX so detectors see real text. Read
-        # ONCE at dispatcher startup and applied to every scan whose ScanRequest
-        # omits `normalization` — which is every scan the gateway sends. A bad
-        # limit action is fatal at start, never defaulted: silently forwarding
-        # at the decode cap where the operator asked to reject is a fail-open
-        # gap.
         # The pool's answer for every scan that does not carry its own
         # `short_circuit` — which is every scan the gateway sends, so this is
         # what decides it in practice. ON: the stages run cheapest-first, so a
@@ -149,12 +155,6 @@ spec:
         # violation details name what denied it and not what went unchecked.
         - name: GUARDRAIL_SHORT_CIRCUIT_DEFAULT
           value: {{ dig "shortCircuitDefault" true (($g).env | default dict) | quote }}
-        - name: GUARDRAIL_NORMALIZATION_DECODE
-          value: {{ ternary "true" "false" (dig "enabled" true $tnDecode) | quote }}
-        - name: GUARDRAIL_NORMALIZATION_MAX_DECODE_LAYERS
-          value: {{ dig "maxLayers" 2 $tnDecode | quote }}
-        - name: GUARDRAIL_NORMALIZATION_DECODE_LIMIT_ACTION
-          value: {{ dig "limitAction" "deny" $tnDecode | quote }}
         {{- end }}
         {{- if eq $s.name "policy-guard" }}
         {{- if include "fortiaigate.vllmEnabled" $ }}
@@ -174,6 +174,11 @@ spec:
           value: "{{ if include "fortiaigate.vllmTls" $ }}https{{ else }}http{{ end }}://vllm-server:{{ include "fortiaigate.vllmHTTPPort" $ }}"
         - name: POLICYGUARD_VLLM_MODEL
           value: {{ include "fortiaigate.policyGuardModelName" $ | quote }}
+        # vLLM runs with --enable-prompt-tokens-details (the same helper
+        # renders the flag): an answer with no prompt_tokens_details had no
+        # prefix-cache hit, which the scan's usage report says as 0.
+        - name: POLICYGUARD_VLLM_PROMPT_TOKENS_DETAILS
+          value: {{ include "fortiaigate.vllmPromptTokensDetails" $ | default "false" | quote }}
         {{- else }}
         # No vLLM in this deployment -- either vllm.replicas is 0 or this is
         # a non-GPU deployment (fortiaigate.gpu.enabled false), which vLLM
@@ -220,14 +225,6 @@ spec:
         - name: GUARDRAIL_METERING_SERVICE_PAIRS
           value: "{{ $pairs := list }}{{ if and (($.Values.fortiaigate.gpu).enabled) (gt (int (($.Values.triton).replicas)) 0) }}{{ $pairs = append $pairs "triton-server=triton-server-metering" }}{{ end }}{{ if include "fortiaigate.vllmEnabled" $ }}{{ $pairs = append $pairs "vllm-server=vllm-server-metering" }}{{ end }}{{ $pairs = concat $pairs (get $externalMetering "servicePairs" | default list) }}{{ join "," $pairs }}"
         {{- end }}
-        {{- if eq $s.name "guardrail" }}
-        # The scan cap in o200k_base tokens (guardrail.env.maxScanTokens): the
-        # most of a block any detector reads, and, 4 bytes a token, the
-        # per-block admission charge. The dispatcher alone reads it; the
-        # scanners keep a fixed ceiling of their own.
-        - name: SCANNER_MAX_SCAN_TOKENS
-          value: {{ $.Values.guardrail.env.maxScanTokens | quote }}
-        {{- end }}
         {{- if ne $s.name "guardrail" }}
         # Scanner detection-cache budget in bytes. Empty = automatic
         # (25% of this container's memory limit). The cache is always capped at
@@ -238,9 +235,14 @@ spec:
         # AND a tool definition's text (as truncated, before it is cut into
         # model windows), so a rule or strictness edit misses on its own — for
         # tool definitions only; its combined conversation is vLLM's prefix
-        # cache's.
+        # cache's. One entry: this scanner's own env.SCANNER_CACHE_MAX_BYTES
+        # when its map sets it (even empty), else guardrail.env.cacheMaxBytes.
+        {{- $cacheBytes := $.Values.guardrail.env.cacheMaxBytes }}
+        {{- if hasKey ($s.cfg.env | default dict) "SCANNER_CACHE_MAX_BYTES" }}
+        {{- $cacheBytes = index $s.cfg.env "SCANNER_CACHE_MAX_BYTES" }}
+        {{- end }}
         - name: SCANNER_CACHE_MAX_BYTES
-          value: {{ $.Values.guardrail.env.cacheMaxBytes | quote }}
+          value: {{ $cacheBytes | quote }}
         {{- end }}
         {{- if $.Values.tls.enabled }}
         - name: FORTIAIGATE_SSL_CERT_FILE
@@ -275,14 +277,16 @@ spec:
           value: "true"
         {{- end }}
         {{- end }}
-        {{- /* per-component extra env (e.g. dlp-scanner CHUNK_SIZE / CHUNK_OVERLAP_SIZE).
-               The dispatcher's two GPU queue sizes are rendered above, from
-               the profile when empty here. */}}
-        {{- range $k, $v := $s.cfg.env }}
-        {{- if not (and (eq $s.name "guardrail") (has $k (list "GUARDRAIL_DLP_QUEUE_CHARS" "GUARDRAIL_POLICY_QUEUE_CHARS"))) }}
-        - name: {{ $k }}
-          value: {{ $v | quote }}
-        {{- end }}
+        {{- /* per-component extra env (e.g. dlp-scanner CHUNK_SIZE / CHUNK_OVERLAP_SIZE),
+               less what $svcs says: a name set above is refused, unless it
+               is one rendered above with the map's value first (the
+               dispatcher's two GPU queue sizes, from the profile when empty
+               here; a scanner's SCANNER_CACHE_MAX_BYTES); the retired
+               GUARDRAIL_SCAN_BUDGET_SECONDS (the Scan time limit on Settings
+               › System Settings since 8.0.3) and SCANNER_MAX_SCAN_CHARS are
+               not passed on. */}}
+        {{- with (include "fortiaigate.extraEnv" (dict "env" $s.cfg.env "path" (printf "guardrail.%s.env" $s.key) "owned" $s.owned "skip" $s.skip) | trim) }}
+        {{- . | nindent 8 }}
         {{- end }}
         {{- /* per-component resources (each component sets its own; empty if unset) */}}
         resources: {{ toYaml ($s.cfg.resources | default dict) | nindent 10 }}

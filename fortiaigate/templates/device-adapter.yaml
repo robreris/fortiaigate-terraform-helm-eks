@@ -1,0 +1,29 @@
+{{- /*
+device-adapter's Service: the device plugin's end, a container of the
+plugin-adapter pod (plugin-adapter.yaml), which managed devices running
+FortiAIGate Client reach under /plugin/device/ (ingress.yaml;
+docs/8.0.3/managed-devices/device-faig-interface.md).
+*/}}
+{{- if include "fortiaigate.deviceAdapterOn" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: device-adapter
+  {{- with include "fortiaigate.publicBackendAnnotations" (dict "root" . "path" "/plugin/device/health/readiness") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+  labels:
+    app.kubernetes.io/name: fortiaigate
+    app.kubernetes.io/part-of: fortiaigate-platform
+    app.kubernetes.io/managed-by: helm
+spec:
+  selector:
+    app: plugin-adapter
+  ports:
+  - protocol: TCP
+    port: 8768
+    targetPort: 8768
+    name: http
+  type: ClusterIP
+{{- end }}

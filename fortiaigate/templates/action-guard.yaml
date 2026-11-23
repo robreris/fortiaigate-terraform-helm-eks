@@ -150,12 +150,19 @@ spec:
         # schema) as mcp-gateway checks them (go-common/vkauth); the compiled
         # guardrail configuration is read here too, and the two logs are
         # written here (go-common/db/store) for api to read. ?ssl= follows
-        # postgresql.tls.enabled: require (encrypt, the self-signed certificate
-        # unverified) or disable. The keys' L2 cache and vk_invalidate are on
+        # postgresql.tls.enabled: verify-full with the internal CA and client
+        # certificate, or disable. The keys' L2 cache and vk_invalidate are on
         # the shared Redis's database 0 (go-common/redis, REDIS_HOST + REDIS_DB
         # unset), NOT the REDIS_URL database above.
         - name: FAIG_DATABASE_URL
           value: "postgresql://{{ .Values.postgresql.auth.username }}:$(POSTGRES_PASSWORD)@{{ .Release.Name }}-postgresql:{{ .Values.postgresql.primary.service.port }}/{{ .Values.postgresql.auth.database }}?ssl={{ ternary "verify-full" "disable" .Values.postgresql.tls.enabled }}{{ if .Values.postgresql.tls.enabled }}&sslrootcert={{ include "fortiaigate.internalTlsCAFile" . }}&sslcert={{ (include "fortiaigate.internalTlsMountPath" .) }}/tls.crt&sslkey={{ (include "fortiaigate.internalTlsMountPath" .) }}/tls.key{{ end }}"
+        # The two logs' size quota defaults to 15 % of the budget this volume
+        # gives (go-common/storagebudget, as logd reads it); set
+        # ACTION_GUARD_LOG_MAX_SIZE in actionGuard.env to fix it instead. Over it, the
+        # oldest days are dropped, keeping ACTION_GUARD_LOG_MIN_RETENTION_DAYS
+        # (200) while they fit.
+        - name: PV_SIZE
+          value: {{ .Values.storage.size | quote }}
         - name: REDIS_HOST
           valueFrom:
             configMapKeyRef:
@@ -201,10 +208,17 @@ spec:
         # Redis above (go-common/obssession).
         - name: OBSERVABILITY_REDIS_DB
           value: "3"
-        # ---- the rest, verbatim from values ---------------------------------
-        {{- range $k, $v := .Values.actionGuard.env }}
-        - name: {{ $k }}
-          value: {{ $v | quote }}
+        # ---- the rest, from actionGuard.env ---------------------------------
+        {{- /* A name set above in any mode is refused (fortiaigate.extraEnv,
+               Mantis 1354184); EVENT_BUS_ENABLED is the map's when it has it. */}}
+        {{- $owned := list "FAIG_INTERNAL_TLS_CA_FILE" "FAIG_INTERNAL_TLS_CERT_FILE" "FAIG_INTERNAL_TLS_KEY_FILE"
+          "FAIG_INTERNAL_TLS_CLIENT_AUTH" "FORTIAIGATE_SSL_CERT_FILE" "FORTIAIGATE_SSL_KEY_FILE"
+          "FAIG_MCP_ADMISSION_KEY" "LOG_LEVEL" "POSTGRES_PASSWORD" "FAIG_DATABASE_URL" "PV_SIZE"
+          "REDIS_PASSWORD" "REDIS_URL" "REDIS_CLUSTER" "REDIS_HOST" "REDIS_PORT" "REDIS_SSL_VERIFY"
+          "REDIS_SSL_ENABLED" "REDIS_SSL_CERTFILE" "REDIS_SSL_KEYFILE" "REDIS_SSL_CA_CERTS"
+          "OBSERVABILITY_REDIS_DB" }}
+        {{- with (include "fortiaigate.extraEnv" (dict "env" .Values.actionGuard.env "path" "actionGuard.env" "owned" $owned) | trim) }}
+        {{- . | nindent 8 }}
         {{- end }}
         volumeMounts:
         # Writable scratch for WeasyPrint / matplotlib / fontconfig caches —
@@ -241,9 +255,9 @@ metadata:
     app.kubernetes.io/part-of: fortiaigate-platform
     component: action-guard
 spec:
-  # ClusterIP only: mcp-gateway, plugin-adapter and inference-hooks call it
-  # in-cluster, and it is NOT on the ingress (templates/ingress.yaml routes
-  # only /api/, /ui, /ai, /). Note /swagger and /internal/metrics are served
+  # ClusterIP only: mcp-gateway and plugin-adapter call it in-cluster, and it
+  # is NOT on the ingress (templates/ingress.yaml routes only /api/, /ui, /ai,
+  # /). Note /swagger and /internal/metrics are served
   # without a virtual key on this port: under tls.mutual only to the pods that
   # present the internal pair, else contained by it not being reachable from
   # outside the cluster. The port keeps the name http with tls.enabled.

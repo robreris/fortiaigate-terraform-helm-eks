@@ -13,7 +13,7 @@ image_repository = "<account-id>.dkr.ecr.<region>.amazonaws.com/fortiaigate-v803
 
 aws_region     = "us-east-1"
 cluster_name   = "fortiaigate-dev"
-image_tag      = "V8.0.3-build6207"
+image_tag      = "V8.0.3-build6220"
 app_node_count = 1
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ gpu_tuning_profile     = "auto" # Selects shared A10G settings for G5; no YAML o
 aws_load_balancer_controller_enabled = true
 ingress_class                        = "alb"
 # Public HTTPS example; replace the hostname and certificate ARN.
-# For private HTTP evaluation, use examples/internal-alb/terraform.tfvars.
+# For private HTTPS deployment, use examples/internal-alb/terraform.tfvars.
 internal     = false
 ingress_host = "fortiaigate.example.com"
 ingress_annotations = {

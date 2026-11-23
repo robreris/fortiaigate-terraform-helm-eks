@@ -7,7 +7,7 @@ default certificate (tls.cert) carries no SAN to verify a Service name
 against. To verify, create a ServersTransport with your CA and serverName and
 set ingress.traefik.serversTransport.
 */ -}}
-{{- if and (or .Values.tls.enabled .Values.auth.enabled) (eq (include "fortiaigate.ingressController" .) "traefik") (not ((.Values.ingress).traefik).serversTransport) }}
+{{- if and .Values.tls.enabled (eq (include "fortiaigate.ingressController" .) "traefik") (not ((.Values.ingress).traefik).serversTransport) }}
 apiVersion: traefik.io/v1alpha1
 kind: ServersTransport
 metadata:

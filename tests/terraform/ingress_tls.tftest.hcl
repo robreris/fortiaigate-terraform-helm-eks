@@ -4,12 +4,13 @@ mock_provider "kubernetes" {}
 mock_provider "tls" {}
 
 variables {
-  image_repository = "example.com/fortiaigate"
-  ingress_class    = "alb"
-  ingress_host     = "fortiaigate.example.com"
+  acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/test"
+  image_repository    = "example.com/fortiaigate"
+  ingress_class       = "alb"
+  ingress_host        = "fortiaigate.example.com"
 }
 
-run "internal_http" {
+run "internal_certificate_names" {
   command = apply
   variables { internal = true }
   assert {
@@ -28,10 +29,15 @@ run "internal_http" {
     )
     error_message = "The internal certificate must retain the previous service names and cover the new services and the vLLM loopback probe."
   }
-  assert {
-    condition     = yamldecode(local.ingress_annotation_values[0]).ingress.annotations["alb.ingress.kubernetes.io/scheme"] == "internal" && jsondecode(yamldecode(local.ingress_annotation_values[0]).ingress.annotations["alb.ingress.kubernetes.io/listen-ports"])[0].HTTP == 80
-    error_message = "Internal mode without ACM must explicitly create a private HTTP listener."
+}
+
+run "reject_internal_alb_without_acm" {
+  command = plan
+  variables {
+    internal            = true
+    acm_certificate_arn = ""
   }
+  expect_failures = [terraform_data.ingress_configuration]
 }
 
 run "internal_certificate_auth_overrides" {
@@ -60,7 +66,8 @@ run "internal_https" {
 run "external_https_legacy_annotation" {
   command = apply
   variables {
-    internal = false
+    internal            = false
+    acm_certificate_arn = ""
     ingress_annotations = {
       "alb.ingress.kubernetes.io/certificate-arn" = "arn:aws:acm:us-east-1:123456789012:certificate/test"
     }
@@ -111,6 +118,7 @@ run "reject_incomplete_key_pair" {
 run "reject_legacy_acm_wrong_region" {
   command = plan
   variables {
+    acm_certificate_arn = ""
     ingress_annotations = {
       "alb.ingress.kubernetes.io/certificate-arn" = "arn:aws:acm:us-west-2:123456789012:certificate/test"
     }

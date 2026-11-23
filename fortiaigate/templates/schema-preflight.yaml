@@ -1,8 +1,25 @@
 {{- if and .Release.IsUpgrade .Values.api.schemaPreflight.enabled }}
 {{- $postgres := .Subcharts.postgresql }}
+{{- $pgTls := "" }}
+{{- if .Values.postgresql.tls.enabled }}
+{{- $tlsSecret := lookup "v1" "Secret" .Release.Namespace (include "fortiaigate.internalTlsSecretName" .) }}
+{{- $pgSecret := lookup "v1" "Secret" .Release.Namespace (include "postgresql.v1.secretName" $postgres) }}
+{{- $pgTls = include "fortiaigate.schemaPreflightTls" (dict "secret" $tlsSecret "live" (not (empty $pgSecret))) }}
+{{- if and .Values.tls.internalExistingSecret $tlsSecret }}
+{{- $pgTls = "verify-full" }}
+{{- end }}
+{{- if eq $pgTls "missing" }}
+{{- fail (printf "PostgreSQL TLS Secret %q is missing. Restore the Secret used by the running PostgreSQL before upgrading." (include "fortiaigate.internalTlsSecretName" .)) }}
+{{- end }}
+{{- end }}
 # This Job only reads the existing database. Helm waits for it before changing
 # any release resources, including Deployments. Maintenance never runs here:
 # pre-upgrade hooks still have live application writers.
+#
+# For the same reason it dials the PostgreSQL that is running, which serves
+# the currently deployed internal certificate, and verifies it the way
+# fortiaigate.schemaPreflightTls decides: as api does, except on the first
+# upgrade from 8.0.2, whose certificate names no Service.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -64,6 +81,12 @@ spec:
             - {name: POSTGRES_SSL_KEYFILE, value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}}
             - {name: POSTGRES_SSL_CA_CERTS, value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}}
             - {name: POSTGRES_SSL_VERIFY, value: "true"}
+            {{- if eq $pgTls "verify-ca" }}
+            # PostgreSQL still serves the 8.0.2 certificate: the chain, not the
+            # name. An explicit sslmode wins over POSTGRES_SSL_VERIFY
+            # (go-common/db/dsn.go).
+            - {name: POSTGRES_SSLMODE, value: verify-ca}
+            {{- end }}
           volumeMounts:
             - name: postgres-tls
               mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) }}

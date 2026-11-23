@@ -6,7 +6,7 @@ directory=${2:?Persistent private PKI directory required}
 prefix=${3:-faig-auth}
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 bash "$here/auth-pki.sh" "$directory"
-for pair in 'server:server' 'api:api' 'mcp:mcp' 'llm:llm' 'plugin-mcp:plugin-mcp' 'adapter:adapter'; do
+for pair in 'server:server' 'api:api' 'mcp:mcp' 'llm:llm' 'plugin-mcp:plugin-mcp' 'adapter:adapter' 'device:device'; do
   name=${pair%:*}; folder=${pair#*:}
   # Refuse replacement: existing vault/signing material may protect stored data.
   if kubectl -n "$namespace" get secret "$prefix-$name" >/dev/null 2>&1; then

@@ -1,6 +1,7 @@
 .codex
 .kuberlr
 .terraform/
+chatgpt*
 # .terraform.lock.hcl is tracked in git for reproducible provider selections.
 # Run `terraform init -upgrade` to refresh it.
 

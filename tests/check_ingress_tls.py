@@ -35,35 +35,43 @@ for controller in ("alb", "nginx"):
     ingress = next(d for d in docs if d["kind"] == "Ingress" and d["metadata"]["name"] == "fortiaigate-ingress")
     if controller == "alb":
         assert "tls" not in ingress["spec"], "ALB must not discover frontend certificates from backend TLS hosts"
+        assert "TLS13" in ingress["metadata"]["annotations"]["alb.ingress.kubernetes.io/ssl-policy"]
         for scheme in ("internal", "internet-facing"):
             other = next(d for d in render(controller, scheme=scheme) if d["kind"] == "Ingress")
             assert other["metadata"]["annotations"]["alb.ingress.kubernetes.io/scheme"] == scheme
-        for d in docs:
-            if d["kind"] == "Service" and d["metadata"]["name"] in ("api", "llm-gateway", "webui"):
-                expected = {"api": "/openapi.json", "llm-gateway": "/fortiaigate/health/readiness", "webui": "/ui"}
-                assert d["metadata"]["annotations"]["alb.ingress.kubernetes.io/healthcheck-path"] == expected[d["metadata"]["name"]]
     else:
         assert ingress["spec"]["tls"][0]["secretName"] == "web-tls"
         assert ingress["metadata"]["annotations"]["nginx.ingress.kubernetes.io/backend-protocol"] == "HTTPS"
     workloads = pods(docs)
     rotated = pods(render(controller, web_checksum="web-v2"))
     services = {d["metadata"]["name"]: d for d in docs if d["kind"] == "Service"}
+    assert len([d for d in docs if d["kind"] == "Ingress"]) == 1
     if controller == "alb":
-        for name, protocol in (("auth-oauth", "HTTP"), ("auth-scim", "HTTPS")):
+        paths = {
+            "api": "/api/healthz",
+            "auth": "/healthz",
+            "device-adapter": "/plugin/device/health/readiness",
+            "llm-gateway": "/fortiaigate/health/readiness",
+            "mcp-gateway": "/healthz",
+            "plugin-adapter": "/plugin/health/readiness",
+            "plugin-adapter-mcp": "/api/v1/plugins/health/readiness",
+            "webui": "/ui/",
+        }
+        for name, path in paths.items():
             annotations = services[name]["metadata"]["annotations"]
-            assert annotations["alb.ingress.kubernetes.io/backend-protocol"] == protocol
-            assert annotations["alb.ingress.kubernetes.io/healthcheck-protocol"] == "HTTP"
-            assert annotations["alb.ingress.kubernetes.io/healthcheck-port"] == "9002"
-            assert annotations["alb.ingress.kubernetes.io/healthcheck-path"] == "/healthz"
+            assert annotations["alb.ingress.kubernetes.io/healthcheck-protocol"] == "HTTPS"
+            assert annotations["alb.ingress.kubernetes.io/healthcheck-port"] == "traffic-port"
+            assert annotations["alb.ingress.kubernetes.io/healthcheck-path"] == path
     else:
-        for name in ("fortiaigate-auth-oauth", "fortiaigate-auth-scim"):
-            auth_ingress = next(d for d in docs if d["kind"] == "Ingress" and d["metadata"]["name"] == name)
-            assert auth_ingress["spec"]["tls"][0]["secretName"] == "web-tls"
-    web_workloads = {"api", "llm-gateway", "webui", "mcp-gateway", "plugin-adapter"}
+        paths = ingress["spec"]["rules"][0]["http"]["paths"]
+        metadata = [p for p in paths if p["path"].startswith("/.well-known/")]
+        assert len(metadata) == 3
+        assert all(p["pathType"] == "ImplementationSpecific" for p in metadata)
+    web_workloads = {"api", "auth", "llm-gateway", "webui", "mcp-gateway", "plugin-adapter"}
     for name, template in workloads.items():
         pod = template["spec"]
         volumes = {v["name"]: v for v in pod.get("volumes", [])}
-        web_volume = "tls-certs" if name == "webui" else "external-tls-certs"
+        web_volume = {"webui": "tls-certs", "auth": "public-tls"}.get(name, "external-tls-certs")
         if name in web_workloads:
             assert volumes[web_volume]["secret"]["secretName"] == "web-tls", name
         if name in ("api", "llm-gateway", "logd", "license-manager", "auth"):
@@ -79,3 +87,15 @@ for controller in ("alb", "nginx"):
         changed = template["metadata"]["annotations"] != rotated[name]["metadata"]["annotations"]
         assert changed == (name in web_workloads), name
     print(f"{controller}: exposure, health checks, TLS mounts and web-only certificate rotation passed")
+
+for annotation, value, expected_error in (
+    ("listen-ports", '[{"HTTP":80}]', "requires an ALB HTTPS listener"),
+    ("ssl-policy", "ELBSecurityPolicy-2016-08", "requires an ALB TLS 1.3 security policy"),
+):
+    override = {"ingress": {"className": "alb", "annotations": {
+        f"alb.ingress.kubernetes.io/{annotation}": value,
+    }}}
+    result = subprocess.run(["helm", "template", "fortiaigate", str(CHART), "-f", "-"],
+                            input=yaml.safe_dump(override), text=True, capture_output=True)
+    assert result.returncode and expected_error in result.stderr, result.stderr
+print("ALB rejects HTTP-only listeners and TLS policies without TLS 1.3")

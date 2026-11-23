@@ -27,10 +27,11 @@ if [[ -f "$root/.complete" ]]; then
   }
   late_identity llm llm-gateway spiffe://faig/deployment/llm-gateway LLM
   late_identity plugin-mcp plugin-adapter-mcp spiffe://faig/deployment/plugin-adapter-mcp 'plugin MCP'
+  late_identity device device-adapter spiffe://faig/deployment/device-adapter 'device adapter'
   exit 0
 fi
 [[ -z "$(find "$root" -mindepth 1 ! -type d -print -quit)" ]] || { echo 'Partial Auth identity exists. Restore or inspect it before retry.' >&2; exit 1; }
-mkdir -p "$root"/{issuer,server,api,mcp,llm,plugin-mcp,adapter}
+mkdir -p "$root"/{issuer,server,api,mcp,llm,plugin-mcp,adapter,device}
 openssl req -x509 -newkey rsa:3072 -nodes -days 825 -subj '/CN=FortiAIGate workload CA' -keyout "$root/issuer/ca.key" -out "$root/issuer/ca.crt" >/dev/null 2>&1
 leaf() {
   local dir=$1 name=$2 usage=$3 san=$4
@@ -46,6 +47,7 @@ leaf "$root/api" api clientAuth 'URI:spiffe://faig/deployment/api'
 leaf "$root/mcp" mcp-gateway clientAuth 'URI:spiffe://faig/deployment/mcp-gateway'
 leaf "$root/llm" llm-gateway clientAuth 'URI:spiffe://faig/deployment/llm-gateway'
 leaf "$root/plugin-mcp" plugin-adapter-mcp clientAuth 'URI:spiffe://faig/deployment/plugin-adapter-mcp'
+leaf "$root/device" device-adapter clientAuth 'URI:spiffe://faig/deployment/device-adapter'
 leaf "$root/adapter" plugin-adapter serverAuth 'DNS:plugin-adapter'
 openssl req -x509 -newkey rsa:3072 -nodes -days 400 -subj '/CN=FortiAIGate OAuth signing' -keyout "$root/server/oauth-signing.key" -out "$root/server/oauth-signing.crt" >/dev/null 2>&1
 openssl rand -out "$root/server/vault.key" 32
@@ -55,6 +57,6 @@ find "$root" -type d -exec chmod 700 {} +
 find "$root" -type f -exec chmod 600 {} +
 touch "$root/.complete"
 if [[ $(id -u) == 0 ]]; then
-  chown -R 10001:10001 "$root"/{server,api,mcp,llm,plugin-mcp,adapter}
+  chown -R 10001:10001 "$root"/{server,api,mcp,llm,plugin-mcp,adapter,device}
 fi
 printf 'Auth identity is ready. Preserve this directory in the encrypted recovery backup.\n'

@@ -5,6 +5,16 @@
    Release: {{ .Release.Name }}
    Chart Version: {{ .Chart.Version }}
    App Version: {{ .Chart.AppVersion }}
+{{- if and .Values.tls.enabled (not .Values.tls.existingSecret) }}
+{{- $externalTls := include "fortiaigate.externalTls" . | fromJson }}
+{{- if $externalTls.kept }}
+
+🔒 External TLS certificate: tls.cert ({{ .Values.tls.cert }}) and tls.key ({{ .Values.tls.key }})
+   are not in the chart, so this release kept the certificate it already serves (Secret
+   {{ $externalTls.kept }}). To replace it, put the new certificate and key at those paths
+   and run helm upgrade again.
+{{- end }}
+{{- end }}
 {{- if and (not .Values.tls.internalExistingSecret) (or .Values.tls.enabled .Values.postgresql.tls.enabled .Values.redis.tls.enabled) }}
 {{- $internalTls := include "fortiaigate.internalTls" . | fromJson }}
 
@@ -40,10 +50,31 @@
    Cleanup:
    $ helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
 
-🛡️  Guardrail scan cap: {{ .Values.guardrail.env.maxScanTokens | default "8192" }} o200k_base tokens per block (guardrail.env.maxScanTokens)
+🛡️  Guardrail scanning (scan time limit, maximum scan size, decoding) is set on Settings › System Settings
+   in the console; timeouts and TLS verification on each AI provider (Models › AI Providers) and each
+   MCP server (Agent Security › MCP Servers).
 {{- if hasKey (.Values.guardrail.env | default dict) "maxScanChars" }}
-   ⚠️  guardrail.env.maxScanChars is retired and ignored: the cap is guardrail.env.maxScanTokens,
-      in tokens (an English token is about 4 characters).
+   ⚠️  guardrail.env.maxScanChars is retired and ignored: the scan cap is the Maximum scan size on
+      Settings › System Settings, in tokens (an English token is about 4 characters).
+{{- end }}
+{{- /* Moved to the console in 8.0.3: a key still in a values file has no effect
+       (the chart renders nothing from it). One line per key that is set. */}}
+{{- range $moved := list
+  (list "llmGateway.env.upstreamLlmRequestTimeout" "set the Request timeout per AI provider on Models › AI Providers")
+  (list "llmGateway.env.upstreamBaseUrlKeepaliveTimeout" "set the Connection keep-alive per AI provider on Models › AI Providers")
+  (list "llmGateway.env.upstreamTls.verify" "set TLS verification per AI provider on Models › AI Providers")
+  (list "mcpGateway.upstreamTls.verify" "set TLS verification per MCP server on Agent Security › MCP Servers")
+  (list "mcpGateway.env.UPSTREAM_TLS_VERIFY" "set TLS verification per MCP server on Agent Security › MCP Servers")
+  (list "guardrail.guardrail.env.GUARDRAIL_SCAN_BUDGET_SECONDS" "set the Scan time limit on Settings › System Settings")
+  (list "guardrail.env.maxScanTokens" "set the Maximum scan size on Settings › System Settings")
+  (list "guardrail.dlpScanner.env.SCANNER_MAX_SCAN_CHARS" "set the Maximum scan size on Settings › System Settings")
+  (list "guardrail.policyGuard.env.SCANNER_MAX_SCAN_CHARS" "set the Maximum scan size on Settings › System Settings")
+  (list "guardrail.trafficNormalization.decode.enabled" "set Decode encoded content on Settings › System Settings")
+  (list "guardrail.trafficNormalization.decode.maxLayers" "set Maximum decode layers on Settings › System Settings")
+  (list "guardrail.trafficNormalization.decode.limitAction" "set Decode limit action on Settings › System Settings") }}
+{{- if include "fortiaigate.valuesHas" (dict "values" $.Values "path" (index $moved 0)) }}
+   ⚠️  {{ index $moved 0 }} is ignored: {{ index $moved 1 }}.
+{{- end }}
 {{- end }}
 {{- $paInStream := dig "env" "inStream" (dict) (.Values.pluginAdapter | default dict) }}
 {{- if or (index $paInStream "chunkBytes") (index $paInStream "overlapBytes") }}
@@ -59,6 +90,11 @@
 {{- if or (index $fabInStream "chunkChars") (index $fabInStream "overlapChars") }}
    ⚠️  fabric.inStream.chunkChars / overlapChars are ignored: renamed
       fabric.inStream.windowChars / holdbackChars on 2026-11-05.
+{{- end }}
+{{- $pgEnv := (dig "policyGuard" "env" (dict) (.Values.guardrail | default dict)) | default dict }}
+{{- if hasKey $pgEnv "POLICYGUARD_THRESHOLD" }}
+   ⚠️  guardrail.policyGuard.env.POLICYGUARD_THRESHOLD is retired and ignored (2026-11-13): set the
+      Confidence threshold on each Natural Language detector in the console; one without is judged at 0.6.
 {{- end }}
 
 💻 Resource Usage:
@@ -238,28 +274,23 @@ Claude Code plugin MCP endpoint:
 {{- end }}
   $ kubectl logs -n {{ .Release.Namespace }} -l app=plugin-adapter -c plugin-adapter-mcp -f
 
-{{- if (.Values.inferenceHooks).enabled }}
-{{- $ihIng := .Values.inferenceHooks.ingress | default dict }}
-{{- $ihHost := .Values.ingress.host }}
+Managed devices (FortiAIGate Client):
+{{- if include "fortiaigate.deviceAdapterOn" . }}
+  device-adapter serves {{ if .Values.ingress.host }}https://{{ .Values.ingress.host }}/plugin/device/{{ else }}https://<this host>/plugin/device/{{ end }}; the console's Deployment page has the install command.
+{{- if not (include "fortiaigate.deviceAdapterAuth" .) }}
+  WARNING: it runs without its Auth workload identity, so nobody can sign in on a managed device: devices enroll and are judged by the organization's device key.
+{{- if .Values.auth.autoProvision }}
+  This installation's Auth bundle was made before device-adapter had an identity (2026-11-02).
+{{- end }}
+  To give it one, set deviceAdapter.workloadTlsSecretName to a Secret with tls.crt, tls.key and ca.crt (URI SAN {{ .Values.auth.deviceAdapterWorkloadIdentity }}, issued by the Auth workload issuer).
+{{- end }}
+  $ kubectl logs -n {{ .Release.Namespace }} -l app=plugin-adapter -c device-adapter -f
+{{- else if eq (toString (.Values.pluginAdapter).legacyDevAuth) "true" }}
+  Not deployed: development mode (pluginAdapter.legacyDevAuth) leaves device-adapter out.
+{{- else }}
+  Not deployed (deviceAdapter.enabled=false): the Deployment page says how to turn it on.
+{{- end }}
 
-Claude inference hooks (inferenceHooks.enabled, {{ .Values.inferenceHooks.replicas }} replica(s)):
-  Hook URL: https://{{ $ihHost | default "<this host>" }}/inference-hooks/claude/v1/<endpoint id>
-  The card is inferenceHooks.card: enter endpointId in the URL above, and its requestHeader in claude.ai; signingSecret is claude.ai's.
-  PREREQUISITE: Anthropic checks the certificate of {{ $ihHost | default "that host" }} against the PUBLIC CA trust store, and calls a public host name with an IPv4 address on port 443. A self-signed certificate fails Test connection.
-{{- if .Values.tls.enabled }}
-  Certificate: the platform's (tls.cert / tls.key, Secret fortiaigate-external-tls-secret; ACM on an ALB), shared with the console and the API; it must be from a public CA.
-{{- else }}
-  tls.enabled=false: the ingress serves no certificate for the hook route, and Anthropic calls HTTPS only. End the TLS in front of the ingress with a public CA's certificate.
-{{- end }}
-{{- $ihRanges := compact ($ihIng.sourceRanges | default list) }}
-{{- if $ihRanges }}
-  Only {{ join ", " $ihRanges }} can reach the hook route (inferenceHooks.ingress.sourceRanges); the ingress answers other addresses 403. The ingress controller must see the client's real address.
-{{- else }}
-  Any address can reach the hook route (inferenceHooks.ingress.sourceRanges is empty). Each frame is still checked by its signature. Recommended: set it to Anthropic's 160.79.106.0/24, after you make sure that the ingress controller sees the clients' original source address.
-{{- end }}
-  $ kubectl logs -n {{ .Release.Namespace }} -l app=inference-hooks -f
-{{- end }}
-{{- if .Values.auth.enabled }}
 Auth core starts automatically. Complete normal GUI setup once.
 The organization and public URL come from the confirmed setup record.
 LLM virtual-key accounting is initialized in the setup transaction.
@@ -269,8 +300,3 @@ The workload listener auth:9000 is private and requires mTLS.
 Internal identity Secret: {{ include "fortiaigate.authIdentityName" . }}.
 {{- end }}
 Preserve the Auth identity Secret, configured overrides and database in recovery backups.
-{{- else }}
-Auth core is disabled by an explicit deployment override.
-The supported fresh-install default is auth.enabled=true.
-LLM RBAC accounting requires the internal Auth service.
-{{- end }}

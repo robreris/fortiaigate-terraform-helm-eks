@@ -7,7 +7,7 @@ locals {
     ingress = {
       annotations = merge(
         var.ingress_class == "alb" ? merge(
-          { "alb.ingress.kubernetes.io/listen-ports" = jsonencode(local.alb_https ? [{ HTTPS = 443 }] : [{ HTTP = 80 }]) },
+          { "alb.ingress.kubernetes.io/listen-ports" = jsonencode([{ HTTPS = 443 }]) },
           local.alb_https ? { "alb.ingress.kubernetes.io/certificate-arn" = local.alb_certificate_arn } : {},
         ) : {},
         var.ingress_annotations,
@@ -23,6 +23,10 @@ locals {
 resource "terraform_data" "ingress_configuration" {
   input = local.alb_scheme
   lifecycle {
+    precondition {
+      condition     = var.ingress_class != "alb" || local.alb_https
+      error_message = "FortiAIGate requires an HTTPS listener for public and internal ALBs. Set acm_certificate_arn to a certificate covering the ingress hostname, or supply the certificate-arn ingress annotation."
+    }
     precondition {
       condition     = var.ingress_class != "alb" || lookup(var.ingress_annotations, "alb.ingress.kubernetes.io/scheme", local.alb_scheme) == local.alb_scheme
       error_message = "The ALB scheme annotation conflicts with internal. Set internal=true for private exposure or false for internet-facing exposure, and remove the conflicting annotation."

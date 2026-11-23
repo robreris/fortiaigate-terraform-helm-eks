@@ -2,7 +2,7 @@
 
 Fortinet supplies 18 prebuilt Docker image archives for this release. Load them into Docker, then mirror them to a private ECR registry. The Helm and Docker Compose archives are separate release artifacts.
 
-Use these images with the bundled 8.0.3 chart on `v803`. For 8.0.2 deployments on `main`, use the [build 0055 image instructions](images.md).
+Use these images with the build 6207 chart. The current `v803` chart uses [build 6220 images](images-build6220.md). For 8.0.2 deployments on `main`, use the [build 0055 image instructions](images.md).
 
 ## Image inventory
 
@@ -33,7 +33,7 @@ The script prints the destination registry before authenticating, creates missin
 
 For a large upload that outlasts the 12-hour ECR login, rerun the script to refresh the login and resume. See [AWS's private ECR push instructions](https://docs.aws.amazon.com/AmazonECR/latest/userguide/docker-push-ecr-image.html) for the push permissions.
 
-Use the printed destination for `image_repository` in your deployment tfvars on `v803`.
+Use the printed destination for `image_repository` in your build 6207 deployment tfvars.
 
 ```hcl
 image_repository = "123456789012.dkr.ecr.us-west-2.amazonaws.com/fortiaigate-v803"

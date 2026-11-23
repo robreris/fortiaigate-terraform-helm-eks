@@ -1,4 +1,3 @@
-{{- if .Values.auth.enabled }}
 {{- $a := .Values.auth }}
 {{- if ne $a.llmWorkloadIdentity "spiffe://faig/deployment/llm-gateway" }}
 {{- fail "LLM accounting requires the standard spiffe://faig/deployment/llm-gateway workload identity" }}
@@ -11,6 +10,9 @@
 {{- end }}
 {{- if and $a.autoProvision (not (.Values.pluginAdapterMcp).workloadTlsSecretName) (ne $a.pluginAdapterMcpWorkloadIdentity "spiffe://faig/deployment/plugin-adapter-mcp") }}
 {{- fail "A custom plugin workload identity requires an existing matching plugin workload Secret" }}
+{{- end }}
+{{- if and $a.autoProvision (not (.Values.deviceAdapter).workloadTlsSecretName) (ne $a.deviceAdapterWorkloadIdentity "spiffe://faig/deployment/device-adapter") }}
+{{- fail "A custom device-adapter workload identity requires an existing matching deviceAdapter.workloadTlsSecretName" }}
 {{- end }}
 {{- $secret := include "fortiaigate.authSecret" (dict "root" . "override" $a.serverSecretName) }}
 apiVersion: apps/v1
@@ -30,6 +32,7 @@ spec:
         checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
         {{- end }}
         checksum/config: {{ toJson $a | sha256sum }}
+        checksum/public-tls: {{ include "fortiaigate.externalTlsChecksum" . | quote }}
     spec:
       securityContext:
         runAsNonRoot: true
@@ -58,11 +61,11 @@ spec:
         # The mTLS port accepts workload certificates only. Public metadata
         # confirms OAuth initialization without exposing the private listener.
         readinessProbe:
-          httpGet: {path: /healthz, port: oauth}
+          httpGet: {path: /healthz, port: oauth, scheme: HTTPS}
           initialDelaySeconds: 5
           timeoutSeconds: 3
         livenessProbe:
-          httpGet: {path: /healthz, port: oauth}
+          httpGet: {path: /healthz, port: oauth, scheme: HTTPS}
           initialDelaySeconds: 15
         env:
         # Virtual-key custody uses the same persistent key as API and DP Agent.
@@ -117,9 +120,17 @@ spec:
         - name: FAIG_AUTH_SETUP_PLUGIN_WORKLOADS
           value: {{ list $a.pluginAdapterMcpWorkloadIdentity | toJson | quote }}
         {{- end }}
+        {{- if include "fortiaigate.deviceAdapterOn" . }}
+        # device-adapter resolves the managed devices' resource alone
+        # (agentguard.DeviceResourceID).
+        - name: FAIG_AUTH_SETUP_DEVICE_WORKLOADS
+          value: {{ list $a.deviceAdapterWorkloadIdentity | toJson | quote }}
+        {{- end }}
         - {name: FAIG_AUTH_VAULT_KEY_ID, value: deployment-1}
         - {name: FAIG_AUTH_VAULT_KEY_FILE, value: /run/faig-auth/vault.key}
         - {name: FAIG_AUTH_OAUTH_LISTEN, value: ":9002"}
+        - {name: FAIG_AUTH_OAUTH_TLS_CERT_FILE, value: /run/faig-public-tls/tls.crt}
+        - {name: FAIG_AUTH_OAUTH_TLS_KEY_FILE, value: /run/faig-public-tls/tls.key}
         - {name: FAIG_AUTH_OAUTH_SIGNING_KEY_ID, value: deployment-1}
         - {name: FAIG_AUTH_OAUTH_KEY_FILE, value: /run/faig-auth/oauth-signing.key}
         - {name: FAIG_AUTH_OAUTH_CERT_FILE, value: /run/faig-auth/oauth-signing.crt}
@@ -131,13 +142,14 @@ spec:
         {{- end }}
         - {name: FAIG_AUTH_CONSOLE_BASE_PATH, value: /ui}
         - {name: FAIG_AUTH_SCIM_LISTEN, value: ":9444"}
-        - {name: FAIG_AUTH_SCIM_CERT_FILE, value: /run/faig-auth/auth.crt}
-        - {name: FAIG_AUTH_SCIM_KEY_FILE, value: /run/faig-auth/auth.key}
+        - {name: FAIG_AUTH_SCIM_CERT_FILE, value: /run/faig-public-tls/tls.crt}
+        - {name: FAIG_AUTH_SCIM_KEY_FILE, value: /run/faig-public-tls/tls.key}
         {{- if $a.egressSecretName }}
         - {name: FAIG_AUTH_OAUTH_EGRESS_FILE, value: /run/faig-egress/egress.json}
         {{- end }}
         volumeMounts:
         - {name: identity, mountPath: /run/faig-auth, readOnly: true}
+        - {name: public-tls, mountPath: /run/faig-public-tls, readOnly: true}
         - {name: tmp, mountPath: /tmp}
         {{- if (dig "upstreamTls" "caSecretName" "" $a) }}
         - {name: upstream-ca, mountPath: /run/faig-upstream-ca, readOnly: true}
@@ -149,6 +161,8 @@ spec:
         - {name: egress, mountPath: /run/faig-egress, readOnly: true}
         {{- end }}
       volumes:
+      - name: public-tls
+        secret: {secretName: {{ include "fortiaigate.tlsSecretName" . }}, defaultMode: 0440}
       - name: identity
         secret:
           secretName: {{ $secret | quote }}
@@ -173,6 +187,10 @@ apiVersion: v1
 kind: Service
 metadata:
   name: auth
+  {{- with include "fortiaigate.publicBackendAnnotations" (dict "root" . "path" "/healthz") }}
+  annotations:
+    {{- . | nindent 4 }}
+  {{- end }}
 spec:
   selector: {app: auth}
   ports:
@@ -180,36 +198,3 @@ spec:
   - {name: oauth, port: 9002, targetPort: oauth}
   - {name: scim, port: 9444, targetPort: scim}
   type: ClusterIP
-{{- end }}
-
-{{- if .Values.auth.enabled }}
-{{- $controller := include "fortiaigate.ingressController" . }}
-{{- range $name, $entry := include "fortiaigate.authIngressRoutes" . | fromJson }}
-{{- if or (eq $controller "alb") (eq $name "scim") }}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: auth-{{ $name }}
-  {{- if eq $controller "alb" }}
-  annotations:
-    alb.ingress.kubernetes.io/backend-protocol: {{ $entry.protocol | quote }}
-    alb.ingress.kubernetes.io/healthcheck-protocol: "HTTP"
-    alb.ingress.kubernetes.io/healthcheck-port: "9002"
-    alb.ingress.kubernetes.io/healthcheck-path: "/healthz"
-    alb.ingress.kubernetes.io/success-codes: "200"
-  {{- else if eq $controller "traefik" }}
-  annotations:
-    traefik.ingress.kubernetes.io/service.serversscheme: https
-    traefik.ingress.kubernetes.io/service.serverstransport: {{ include "fortiaigate.traefikServersTransport" $ | quote }}
-  {{- end }}
-spec:
-  selector: {app: auth}
-  ports:
-  - name: {{ $name }}
-    port: {{ $entry.port }}
-    targetPort: {{ $name }}
-  type: ClusterIP
-{{- end }}
-{{- end }}
-{{- end }}

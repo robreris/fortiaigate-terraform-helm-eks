@@ -1,35 +1,3 @@
-{{- $className := include "fortiaigate.ingressController" . }}
-{{- $defaultAnnotations := dict }}
-{{- if eq $className "alb" }}
-{{- $_ := set $defaultAnnotations "kubernetes.io/ingress.class" "alb" }}
-{{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/scheme" "internet-facing" }}
-{{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/target-type" "ip" }}
-{{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/load-balancer-attributes" "idle_timeout.timeout_seconds=600" }}
-{{- if .Values.tls.enabled }}
-{{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/backend-protocol" "HTTPS" }}
-{{- $_ := set $defaultAnnotations "alb.ingress.kubernetes.io/healthcheck-protocol" "HTTPS" }}
-{{- end }}
-{{- else if eq $className "nginx" }}
-{{- $_ := set $defaultAnnotations "nginx.ingress.kubernetes.io/app-root" "/ui" }}
-{{- $_ := set $defaultAnnotations "nginx.ingress.kubernetes.io/proxy-body-size" "64m" }}
-{{- if .Values.tls.enabled }}
-{{- $_ := set $defaultAnnotations "nginx.ingress.kubernetes.io/backend-protocol" "HTTPS" }}
-{{- $_ := set $defaultAnnotations "nginx.ingress.kubernetes.io/healthcheck-protocol" "HTTPS" }}
-{{- $_ := set $defaultAnnotations "nginx.ingress.kubernetes.io/ssl-redirect" "true" }}
-{{- $_ := set $defaultAnnotations "nginx.ingress.kubernetes.io/force-ssl-redirect" "false" }}
-{{- end }}
-{{- else if eq $className "traefik" }}
-{{- if .Values.tls.enabled }}
-{{- $_ := set $defaultAnnotations "traefik.ingress.kubernetes.io/router.entrypoints" "websecure" }}
-{{- $_ := set $defaultAnnotations "traefik.ingress.kubernetes.io/router.middlewares" "default-redirect-https@kubernetescrd" }}
-{{- end }}
-{{- end }}
-{{- $annotations := mergeOverwrite (dict) $defaultAnnotations (.Values.ingress.annotations | default dict) }}
-{{- if and (eq $className "alb") .Values.inferenceHooks.enabled }}
-{{- with compact (.Values.inferenceHooks.ingress.sourceRanges | default list) }}
-{{- $_ := set $annotations "alb.ingress.kubernetes.io/conditions.inference-hooks" (list (dict "field" "source-ip" "sourceIpConfig" (dict "values" .)) | toJson) }}
-{{- end }}
-{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -38,19 +6,15 @@ metadata:
     app.kubernetes.io/name: fortiaigate
     app.kubernetes.io/part-of: fortiaigate-platform
     app.kubernetes.io/managed-by: helm
-  {{- if $annotations }}
   annotations:
-    {{- range $key, $value := $annotations }}
-    {{ $key }}: {{ $value | quote }}
-    {{- end }}
-  {{- end }}
+    {{- include "fortiaigate.ingressAnnotations" . | nindent 4 }}
 
 spec:
   {{- if .Values.ingress.className }}
   ingressClassName: {{ .Values.ingress.className }}
   {{- end }}
 
-  {{- if and .Values.tls.enabled (ne $className "alb") }}
+  {{- if and .Values.tls.enabled (ne (include "fortiaigate.ingressController" .) "alb") }}
   tls:
   - hosts:
     {{- if .Values.ingress.host }}
@@ -69,6 +33,29 @@ spec:
     - http:
     {{- end }}
         paths:
+          # webui is served under the /ui basePath. More-specific API prefixes
+          # are matched first; /ui and / route the webui; /ai routes the LLM
+          # data plane (llm-gateway), which serves that mount root and nothing
+          # outside it.
+          #
+          # OAuth and SCIM use the same HTTPS backend settings as the other
+          # public routes. The private Auth workload port 9000 has no route.
+          {{- range $entry := list (dict "port" 9002 "paths" (list "/oauth" "/.well-known/oauth-authorization-server/oauth" "/.well-known/openid-configuration/oauth" "/api/auth/sso/oidc/callback")) (dict "port" 9444 "paths" (list "/scim/v2" "/api/v1/scim")) }}
+          {{- range $path := $entry.paths }}
+          - path: {{ $path }}
+            pathType: {{ if hasPrefix "/.well-known/" $path }}{{ include "fortiaigate.metadataPathType" $ }}{{ else }}Prefix{{ end }}
+            backend:
+              service:
+                name: auth
+                port:
+                  number: {{ $entry.port }}
+          {{- end }}
+          {{- end }}
+          # /api/v1/plugins/claude-code -> the plugin adapter's MCP endpoint (the
+          # Claude Code plugin's Connector, /api/v1/plugins/claude-code/mcp),
+          # passed through unchanged; nothing else under /api/ goes there. BEFORE
+          # /api/: nginx takes the longest prefix anyway, but an ALB evaluates
+          # its rules in this order.
           - path: /api/v1/plugins/claude-code
             pathType: Prefix
             backend:
@@ -76,20 +63,21 @@ spec:
                 name: plugin-adapter-mcp
                 port:
                   number: 8767
-          {{- if and (eq $className "alb") .Values.auth.enabled }}
-          {{- range $name, $entry := include "fortiaigate.authIngressRoutes" . | fromJson }}
-          {{- range $entry.paths }}
-          - path: {{ . }}
+          {{- if include "fortiaigate.deviceAdapterOn" . }}
+          # /plugin/device -> device-adapter, the device plugin's end (managed
+          # devices running FortiAIGate Client, docs/8.0.3/managed-devices),
+          # passed through unchanged. Before /plugin, which goes to
+          # plugin-adapter in development mode.
+          - path: /plugin/device
             pathType: Prefix
             backend:
               service:
-                name: auth-{{ $name }}
+                name: device-adapter
                 port:
-                  number: {{ $entry.port }}
+                  number: 8768
           {{- end }}
-          {{- end }}
-          {{- end }}
-          # The management API handles the remaining /api/ paths.
+          # /api/ carries the WHOLE management API, /api/v1 included -- one
+          # backend, no per-prefix split (but for the plugin endpoint above).
           - path: /api/
             pathType: Prefix
             backend:
@@ -152,21 +140,12 @@ spec:
                 port:
                   number: {{ $mcpPort }}
           - path: /.well-known/oauth-protected-resource/mcp/gateways
-            pathType: Prefix
+            pathType: {{ include "fortiaigate.metadataPathType" . }}
             backend:
               service:
                 name: mcp-gateway
                 port:
                   number: {{ $mcpPort }}
-          {{- if and (eq $className "alb") .Values.inferenceHooks.enabled }}
-          - path: /inference-hooks
-            pathType: Prefix
-            backend:
-              service:
-                name: inference-hooks
-                port:
-                  number: 8768
-          {{- end }}
           # Root -> the console, matching the docker deployment (nginx.conf
           # sends `= /` to /ui). The gateway used to be the catch-all here, so
           # every typo landed on the data plane and came back as dialect JSON;

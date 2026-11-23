@@ -1,12 +1,12 @@
 # FortiAIGate on AWS EKS
 
-The `v803` branch deploys FortiAIGate 8.0.3 build 6207 with Terraform and the bundled Helm chart. Use `main` for 8.0.2. The stack creates a VPC, EKS cluster, EFS storage, application nodes, an optional GPU node, and an AWS Load Balancer Controller for ALB ingress.
+The `v803` branch deploys FortiAIGate 8.0.3 build 6220 with Terraform and the bundled Helm chart. Use `main` for 8.0.2. The stack creates a VPC, EKS cluster, EFS storage, application nodes, an optional GPU node, and an AWS Load Balancer Controller for ALB ingress.
 
 ## Before you start
 
 - Install Terraform 1.9+, AWS CLI v2, Helm 3, and kubectl compatible with your cluster version (default: 1.31). Check the [EKS version support note](docs/deployment-guide.md#eks-version-support) before creating a cluster.
 - Configure AWS credentials with permission to create VPC, EKS, EC2, EFS, and IAM resources. This deployment creates billable AWS resources, including GPU instances when enabled.
-- Obtain the entitled FortiAIGate images and a deployment license from Fortinet. [Mirror the build 6207 images to ECR](docs/images-build6207.md) before applying. For existing releases, follow the [8.0.3 upgrade steps](docs/deployment-guide.md#upgrading-to-803-build-6207).
+- Obtain the entitled FortiAIGate images and a deployment license from Fortinet. [Mirror the build 6220 images to ECR](docs/images-build6220.md) before applying. For existing releases, follow the [8.0.3 upgrade steps](docs/deployment-guide.md#upgrading-to-803-build-6220).
 - [Create an S3 state bucket and DynamoDB lock table](docs/remote-state.md) once for your account.
 - For the public HTTPS quickstart below, have a hostname and an ACM certificate covering it in the deployment region, plus access to update DNS. GPU inference also needs sufficient EC2 GPU quota and available capacity.
 
@@ -24,7 +24,7 @@ cp backends/backend.hcl.example backends/dev.hcl
 
 Edit both files before continuing:
 
-- `tfvars/dev.tfvars`: set your region, cluster name, ingress hostname, and same-region ACM certificate ARN. Set `image_repository` to your ECR prefix ending in `/fortiaigate-v803`. The default `image_tag` is `V8.0.3-build6207`. Update any older tag in your tfvars. Restrict `alb.ingress.kubernetes.io/inbound-cidrs` to your client networks. This example enables a `g5.2xlarge` GPU with automatic tuning.
+- `tfvars/dev.tfvars`: set your region, cluster name, ingress hostname, and same-region ACM certificate ARN. Set `image_repository` to your ECR prefix ending in `/fortiaigate-v803`. The default `image_tag` is `V8.0.3-build6220`. Update any older tag in your tfvars. Restrict `alb.ingress.kubernetes.io/inbound-cidrs` to your client networks. This example enables a `g5.2xlarge` GPU with automatic tuning.
 - `backends/dev.hcl`: set your state bucket, state key, region, and lock table. Use a separate state key for each deployment.
 
 For private access, use the [internal ALB example](examples/internal-alb/terraform.tfvars) instead; it requires a connection to the VPC. See [all scenarios](examples/README.md) and [ingress/TLS options](docs/ingress-and-tls.md). Keep account files, credentials, and licenses out of git. Use the vendored Helm dependencies; do not run `helm dependency update`.
@@ -72,7 +72,7 @@ terraform output alb_dns_name
 
 Large model images take time to download and initialize; the application Helm timeout is 20 minutes. Point your ingress hostname at the ALB using your DNS provider ([Route 53 example](docs/route53-setup.md)), then open `https://<ingress_host>/ui` and upload the deployment license. Check that the Auth identity provisioning Job completed and verify WebUI sign-in. On GPU deployments, verify a policy-enforced LLM request with DLP and POLICY detectors.
 
-For later updates, use a normal full plan/apply with the same tfvars; skip the cluster bootstrap. Read the [upgrade guide](docs/deployment-guide.md#upgrading-to-803-build-6207) before changing an existing installation.
+For later updates, use a normal full plan/apply with the same tfvars; skip the cluster bootstrap. Read the [upgrade guide](docs/deployment-guide.md#upgrading-to-803-build-6220) before changing an existing installation.
 
 ## Teardown
 

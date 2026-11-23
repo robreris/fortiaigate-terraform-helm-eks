@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows [Kee
 
 ### Added
 
+- Add the build 6220 image inventory and [ECR staging instructions](docs/images-build6220.md), including CPU-only staging.
+
 - Verified FortiAIGate 8.0.3 build 6207 image inventory and [ECR staging instructions](docs/images-build6207.md) with a Bash upload script for all 18 supplied Docker archives.
 
 - Read-only VPC teardown checks for load balancers, target groups and network interfaces, a VPC ID output, and recovery guidance for subnet/internet gateway dependency errors. Require AWS load balancer cleanup verification before removing controllers in the documented workflow.
@@ -19,6 +21,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - CI formatting, Terraform validation, TFLint, Helm lint, chart/GPU/ingress render checks, mocked Terraform validation tests, and real certificate checks.
 
 ### Changed
+
+- Port FortiAIGate 8.0.3 build 6220 with unified Auth routing, managed-device support, and the new model image. Public and internal ALBs require ACM HTTPS and a TLS 1.3 listener policy. The port retains the existing EFS claim, EKS GPU placement, and Terraform-managed TLS Secrets.
 
 - Port the FortiAIGate 8.0.3 build 6207 chart on `v803`, including Auth, new application workloads, and database preflight. Keep the existing EFS claim, EKS GPU placement, Terraform-managed TLS Secrets, and ALB, and use the `fortiaigate-v803` ECR prefix in deployment examples.
 
@@ -37,6 +41,8 @@ All notable changes to this project are documented here. The format follows [Kee
 - Track `.terraform.lock.hcl` for reproducible provider selections.
 
 ### Removed
+
+- Build 6220 retires the standalone inference-hooks workload and the MCP stdio runner.
 
 - `TODO.txt` and `CLAUDE.md`; use `ROADMAP.md`, `AGENTS.md`, and `docs/technical-notes.md`.
 - Duplicate Unreleased sections and superseded intermediate upgrade descriptions.

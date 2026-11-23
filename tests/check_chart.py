@@ -6,16 +6,16 @@ import yaml
 
 CHART = Path(__file__).resolve().parents[1] / "fortiaigate"
 REPO = "example.com/fortiaigate-v803"
-INVENTORY = json.loads((CHART.parent / "docs/build6207-images.json").read_text())
+INVENTORY = json.loads((CHART.parent / "docs/build6220-images.json").read_text())
 TAGS = {image["image"]: image["tag"] for image in INVENTORY["images"]}
 
-for mode in ("cpu", "shared", "dedicated"):
+for mode in ("cpu", "shared", "dedicated", "device-disabled"):
     args = ["helm", "template", "fortiaigate", str(CHART), "--namespace", "fortiaigate"]
     settings = {
         "fortiaigate.image.repository": REPO,
-        "fortiaigate.gpu.enabled": str(mode != "cpu").lower(),
+        "fortiaigate.gpu.enabled": str(mode in {"shared", "dedicated"}).lower(),
         "fortiaigate.updateStrategy": "Recreate",
-        "vllm.gpuAttach": "shared" if mode == "cpu" else mode,
+        "vllm.gpuAttach": "dedicated" if mode == "dedicated" else "shared",
         "fortiaigate.gpuWorkloadPlacement.nodeSelector.fortiaigate-role": "gpu",
         "fortiaigate.gpuWorkloadPlacement.tolerations[0].key": "fortiaigate-gpu",
         "fortiaigate.gpuWorkloadPlacement.tolerations[0].operator": "Equal",
@@ -30,20 +30,16 @@ for mode in ("cpu", "shared", "dedicated"):
         "storage.storageClass": "efs-sc",
     }
     if mode == "shared":
-        settings.update({
-            "fabric.enabled": "true",
-            "inferenceHooks.enabled": "true",
-            "inferenceHooks.card.signingSecret": "whsec_render-test",
-        })
-        args += ["--set-string", "inferenceHooks.card.endpointId=abcdef0123456789abcdef0123456789",
-                 "--set", "inferenceHooks.ingress.sourceRanges[0]=192.0.2.0/24"]
+        settings["fabric.enabled"] = "true"
+    if mode == "device-disabled":
+        settings["deviceAdapter.enabled"] = "false"
     for key, value in settings.items():
         args += ["--set", f"{key}={value}"]
     args += ["--set-string", "fortiaigate.gpuWorkloadPlacement.tolerations[0].value=true",
              "--set", r"ingress.annotations.alb\.ingress\.kubernetes\.io/scheme=internal"]
     docs = list(filter(None, yaml.safe_load_all(subprocess.check_output(args, text=True))))
     workloads = {d["metadata"]["name"]: d for d in docs if d["kind"] in ("Deployment", "StatefulSet", "DaemonSet")}
-    assert not {"core", "language-scanner", "code-scanner"} & workloads.keys()
+    assert not {"core", "language-scanner", "code-scanner", "inference-hooks"} & workloads.keys()
     assert workloads["license-manager"]["kind"] == "Deployment"
     images = set()
     for name, workload in workloads.items():
@@ -58,10 +54,12 @@ for mode in ("cpu", "shared", "dedicated"):
             if c["image"].startswith(REPO):
                 images.add(c["image"])
     excluded = set()
-    if mode == "cpu":
+    if mode in {"cpu", "device-disabled"}:
         excluded.update(("custom-triton", "vllm-server", "faig-models"))
     if mode != "shared":
-        excluded.update(("fabric", "inference-hooks"))
+        excluded.add("fabric")
+    if mode == "device-disabled":
+        excluded.add("device-adapter")
     expected = {f"{REPO}/{name}:{tag}" for name, tag in TAGS.items() if name not in excluded}
     assert images == expected, (mode, images ^ expected)
     gpu_names = {"triton-vllm-server"} if mode == "shared" else {"triton-server", "vllm-server"} if mode == "dedicated" else set()
@@ -79,15 +77,17 @@ for mode in ("cpu", "shared", "dedicated"):
     assert annotations["alb.ingress.kubernetes.io/scheme"] == "internal"
     assert annotations["alb.ingress.kubernetes.io/target-type"] == "ip"
     assert annotations["alb.ingress.kubernetes.io/backend-protocol"] == "HTTPS"
-    routes = {p["path"]: p["backend"]["service"]["name"] for p in ingress["spec"]["rules"][0]["http"]["paths"]}
+    assert "TLS13" in annotations["alb.ingress.kubernetes.io/ssl-policy"]
+    backends = {p["path"]: p["backend"]["service"] for p in ingress["spec"]["rules"][0]["http"]["paths"]}
+    routes = {path: backend["name"] for path, backend in backends.items()}
     expected_routes = {
         "/api/v1/plugins/claude-code": "plugin-adapter-mcp",
-        "/oauth": "auth-oauth",
-        "/.well-known/oauth-authorization-server/oauth": "auth-oauth",
-        "/.well-known/openid-configuration/oauth": "auth-oauth",
-        "/api/auth/sso/oidc/callback": "auth-oauth",
-        "/scim/v2": "auth-scim",
-        "/api/v1/scim": "auth-scim",
+        "/oauth": "auth",
+        "/.well-known/oauth-authorization-server/oauth": "auth",
+        "/.well-known/openid-configuration/oauth": "auth",
+        "/api/auth/sso/oidc/callback": "auth",
+        "/scim/v2": "auth",
+        "/api/v1/scim": "auth",
         "/api/": "api",
         "/ui": "webui",
         "/ai": "llm-gateway",
@@ -96,10 +96,23 @@ for mode in ("cpu", "shared", "dedicated"):
         "/.well-known/oauth-protected-resource/mcp/gateways": "mcp-gateway",
         "/": "webui",
     }
-    if mode == "shared":
-        expected_routes["/inference-hooks"] = "inference-hooks"
-        conditions = json.loads(annotations["alb.ingress.kubernetes.io/conditions.inference-hooks"])
-        assert conditions == [{"field": "source-ip", "sourceIpConfig": {"values": ["192.0.2.0/24"]}}]
+    if mode != "device-disabled":
+        expected_routes["/plugin/device"] = "device-adapter"
+        assert list(routes).index("/plugin/device") < list(routes).index("/plugin")
+        plugin_pod = workloads["plugin-adapter"]["spec"]["template"]["spec"]
+        device = next(c for c in plugin_pod["containers"] if c["name"] == "device-adapter")
+        assert device["readinessProbe"]["httpGet"]["scheme"] == "HTTPS"
+        device_env = {e["name"]: e.get("value") for e in device["env"]}
+        for name in ("FAIG_INTERNAL_TLS_CA_FILE", "POSTGRES_SSL_CA_CERTS", "REDIS_SSL_CA_CERTS"):
+            assert device_env[name] == "/etc/internal-tls/ca.crt", name
+        assert any(m["name"] == "tls-certs" and m["mountPath"] == "/etc/internal-tls"
+                   for m in device["volumeMounts"])
+        device_tls = next(v["secret"] for v in plugin_pod["volumes"] if v["name"] == "device-workload-tls")
+        assert device_tls["secretName"] == "fortiaigate-auth-identity"
+        assert {entry["key"] for entry in device_tls["items"]} == {"device-tls.crt", "device-tls.key", "device-ca.crt"}
+    assert backends["/oauth"]["port"]["number"] == 9002
+    assert backends["/scim/v2"]["port"]["number"] == 9444
+    assert all(backend["port"]["number"] != 9000 for backend in backends.values())
     assert routes == expected_routes, (mode, routes)
     assert list(routes).index("/api/auth/sso/oidc/callback") < list(routes).index("/api/")
     assert sum(d["kind"] == "Ingress" for d in docs) == 1
@@ -124,4 +137,4 @@ for mode in ("cpu", "shared", "dedicated"):
     assert {"name": "POSTGRES_SSL_CA_CERTS", "value": "/etc/internal-tls/ca.crt"} in preflight["env"]
     assert {"name": "postgres-tls", "mountPath": "/etc/internal-tls", "readOnly": True} in preflight["volumeMounts"]
     assert pod["volumes"][0]["secret"]["secretName"] == "internal-tls"
-    print(f"{mode}: image, storage, GPU, ALB, Auth and schema preflight renders passed")
+    print(f"{mode}: image, storage, GPU, ALB, Auth, managed devices and schema preflight renders passed")

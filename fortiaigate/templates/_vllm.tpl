@@ -51,7 +51,7 @@ fortiaigate.vllmModelLoader below both render it. The only other pin is
 .gitlab-ci.yml's triton_pull_and_pack; bump the two together.
 */}}
 {{- define "fortiaigate.modelsImage" -}}
-{{ .Values.fortiaigate.image.repository }}/faig-models:0.0.5-s1
+{{ .Values.fortiaigate.image.repository }}/faig-models:0.0.6-s1
 {{- end }}
 
 {{/* vLLM's OpenAI-compatible HTTP port (--port, Service vllm-server). */}}
@@ -380,6 +380,16 @@ guard is silent in the normal case.
     {{- with include "fortiaigate.gpuParamInt" (dict "root" $root "section" "vllm" "key" "blockSize" "explicit" (index $vllmV "blockSize") "what" "vllm.blockSize" "min" 1) }}
     - --block-size={{ . }}
     {{- end }}
+    {{- end }}
+    {{- /* The prefix-cache hits of each request, in its usage
+           (usage.prompt_tokens_details.cached_tokens): policy-guard's
+           figure for the scan's usage report (the POLICY KV hits). Off
+           with vllm.promptTokensDetails false, or when the last such flag
+           in vllm.extraArgs is --no-enable-prompt-tokens-details; skipped
+           when vllm.extraArgs already carries it
+           (fortiaigate.vllmPromptTokensDetails). */}}
+    {{- if and (include "fortiaigate.vllmPromptTokensDetails" $root) (not (include "fortiaigate.vllmExtraArgHas" (dict "root" $root "flag" "--enable-prompt-tokens-details"))) }}
+    - --enable-prompt-tokens-details
     {{- end }}
     # No --language-model-only: the pinned checkpoint is text-only and
     # declares no modalities, so vLLM's image/audio request paths are

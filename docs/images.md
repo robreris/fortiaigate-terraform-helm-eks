@@ -1,6 +1,6 @@
 # FortiAIGate 8.0.2 container images
 
-For the 8.0.3 chart on this branch, see the [build 6207 ECR guide](images-build6207.md). The instructions below apply to build 0055 on `main`.
+For the 8.0.3 chart on this branch, see the [build 6220 ECR guide](images-build6220.md). The instructions below apply to build 0055 on `main`.
 
 FortiAIGate 8.0.2 build0055 uses the following images under `var.image_repository`. The tags below were verified against the Docker manifests in the supplied 8.0.2 build0055 archives.
 
@@ -42,39 +42,63 @@ The old `core`, `scanner`, and `triton-models` images are no longer used.
 
 ## Load and push to ECR
 
-This loads the ten Fortinet archives locally, creates ECR repositories, and pushes the verified tags. It requires Docker, AWS CLI credentials, and access to the supplied image archives. Set `BUILD_DIR` to the directory containing those archives. The large inference archives require sufficient local disk space.
+Set `BUILD_DIR` to the directory containing the individual Fortinet Docker `.tar` files after extracting the release bundle. Use the full version and build from the filename for `BUILD_RELEASE`, with the version immediately after the uppercase `V`. For `FAIG_api-V8.0.3-build6220-FORTINET.tar`, set `BUILD_RELEASE=V8.0.3-build6220`. The snippet reads each matching archive's `manifest.json` to find its Docker tag, including the separately versioned GPU images. Use Bash, GNU tar, jq, Docker, and AWS CLI credentials for the destination account. Allow enough local disk space for the large inference images.
+
+Set `AWS_REGION` and `ACCOUNT_ID` for your destination. Set `ECR_PREFIX` to the path after the registry hostname in Terraform's `image_repository`, such as `fortiaigate-v803` for 8.0.3. The loop stages the matching archives present in `BUILD_DIR`, so include every Fortinet image required by the target chart.
 
 ```bash
 set -euo pipefail
-AWS_REGION="us-west-2"
-ACCOUNT_ID="123456789012"
+shopt -s nullglob
+: "${AWS_REGION:?Set AWS_REGION to the destination ECR region}"
+: "${ACCOUNT_ID:?Set ACCOUNT_ID to the destination AWS account ID}"
+: "${BUILD_DIR:?Set BUILD_DIR to the directory containing the individual Docker archives}"
+: "${BUILD_RELEASE:?Set BUILD_RELEASE to the full version and build in the filenames, such as V8.0.3-build6220}"
 REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-: "${BUILD_DIR:?Set BUILD_DIR to the directory containing the supplied build0055 image archives}"
+ECR_PREFIX="${ECR_PREFIX:-fortiaigate}"
 SOURCE="dops-jfrog.fortinet-us.com/docker-fortiaigate-local"
-TAG="V8.0.2-build0055"
+
+archives=("$BUILD_DIR"/FAIG_*"-${BUILD_RELEASE}-FORTINET.tar")
+if (( ${#archives[@]} == 0 )); then
+  printf 'No Docker archives for %s in %s\n' "$BUILD_RELEASE" "$BUILD_DIR" >&2
+  exit 1
+fi
+
+declare -A image_tags
+for archive in "${archives[@]}"; do
+  filename=${archive##*/}
+  img=${filename#FAIG_}
+  img=${img%"-${BUILD_RELEASE}-FORTINET.tar"}
+  if ! image_tag=$(tar --occurrence=1 -xOf "$archive" manifest.json \
+    | jq -er --arg prefix "${SOURCE}/${img}:" '
+        [.[] | .RepoTags[]? | select(startswith($prefix)) | ltrimstr($prefix)]
+        | unique
+        | if length == 1 and .[0] != "" then .[0] else error("Expected one tag for " + $prefix) end
+      '); then
+    printf 'Could not determine the tag for %s from %s\n' "$img" "$archive" >&2
+    exit 1
+  fi
+  image_tags["$img"]=$image_tag
+done
 
 aws ecr get-login-password --region "$AWS_REGION" \
   | docker login --username AWS --password-stdin "$REGISTRY"
 
-for img in api llm-gateway webui logd license_manager guardrail guardrail-scanner custom-triton vllm-server faig-models; do
-  docker load -i "${BUILD_DIR}/FAIG_${img}-${TAG}-FORTINET.tar"
+for img in "${!image_tags[@]}"; do
+  image_tag=${image_tags[$img]}
+  repository="${ECR_PREFIX}/${img}"
+  destination="${REGISTRY}/${repository}:${image_tag}"
+  docker load -i "${BUILD_DIR}/FAIG_${img}-${BUILD_RELEASE}-FORTINET.tar"
   if ! aws ecr describe-repositories --region "$AWS_REGION" \
-    --repository-names "fortiaigate/${img}" >/dev/null 2>&1; then
+    --repository-names "$repository" >/dev/null 2>&1; then
     aws ecr create-repository --region "$AWS_REGION" \
-      --repository-name "fortiaigate/${img}"
+      --repository-name "$repository"
   fi
-  case "$img" in
-    custom-triton) image_tag="25.11-onnx-trt-agt-rpt-s1" ;;
-    vllm-server) image_tag="0.28.0-rpt-s1" ;;
-    faig-models) image_tag="0.0.5-s1" ;;
-    *) image_tag="$TAG" ;;
-  esac
-  docker tag "${SOURCE}/${img}:${image_tag}" "${REGISTRY}/fortiaigate/${img}:${image_tag}"
-  docker push "${REGISTRY}/fortiaigate/${img}:${image_tag}"
+  docker tag "${SOURCE}/${img}:${image_tag}" "$destination"
+  docker push "$destination"
 done
 ```
 
-Then configure Terraform:
+Set Terraform's `image_tag` to the application tag from the archives. Confirm the chart's GPU image pins match the tags you pushed. For build 0055, use:
 
 ```hcl
 image_repository = "123456789012.dkr.ecr.us-west-2.amazonaws.com/fortiaigate"

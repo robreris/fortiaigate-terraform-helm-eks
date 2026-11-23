@@ -121,8 +121,8 @@ and redis.tls.authClients, and their clients always present the pair.
 {{/*
 The DNS names the internal certificate carries (beside IP 127.0.0.1), comma
 separated: every Service a pod dials over TLS with it and checks by name, and
-localhost. A listener the ingress routes to (inference-hooks, mcp-gateway's
-:8443, plugin-adapter's) serves the external certificate instead, so it is not
+localhost. A listener the ingress routes to (mcp-gateway's :8443,
+plugin-adapter's) serves the external certificate instead, so it is not
 named here. A name added here regenerates the certificate on the next upgrade
 (fortiaigate.internalTlsDecide), because a client that checks a name the
 certificate lacks refuses every connection.
@@ -139,7 +139,7 @@ only the new one.
 {{- end }}
 
 {{/*
-The URL its callers (plugin-adapter, inference-hooks, mcp-gateway) take for a
+The URL its callers (plugin-adapter, mcp-gateway) take for a
 companion service in the deployment, from "root", "name" and "port": with
 tls.enabled https, where the service serves the internal certificate, which
 names it, and under tls.mutual serves only the pods that present the internal
@@ -217,6 +217,121 @@ time.
 */}}
 {{- define "fortiaigate.internalTlsRevision" -}}
 {{- (include "fortiaigate.internalTls" . | fromJson).revision -}}
+{{- end }}
+
+{{/*
+The EXTERNAL certificate (tls.cert / tls.key) in this render, as JSON: "crt"
+and "key" (base64, as fortiaigate-external-tls-secret holds them) and "kept"
+(the Secret they were kept from, or empty when they come from the chart's
+files). Decided by fortiaigate.externalTlsDecide from the two files and the
+Secrets as they are in the cluster. Call it only with tls.enabled: nothing
+serves the certificate otherwise.
+*/}}
+{{- define "fortiaigate.externalTls" -}}
+{{- $certPath := .Values.tls.cert | default "" -}}
+{{- $keyPath := .Values.tls.key | default "" -}}
+{{- include "fortiaigate.externalTlsDecide" (dict "crt" (tpl (.Files.Get $certPath) .) "key" (tpl (.Files.Get $keyPath) .) "certPath" $certPath "keyPath" $keyPath "external" (lookup "v1" "Secret" .Release.Namespace "fortiaigate-external-tls-secret") "legacy" (lookup "v1" "Secret" .Release.Namespace "fortiaigate-tls-secret")) -}}
+{{- end }}
+
+{{/*
+fortiaigate.externalTls's decision, from "crt" and "key" (the contents of the
+files tls.cert and tls.key name, through tpl; .Files.Get answers "" for a file
+the chart does not have), "certPath" and "keyPath" (the two values, for the
+messages), "external" (fortiaigate-external-tls-secret as it is in the
+cluster) and "legacy" (fortiaigate-tls-secret as it is), each an empty map
+when there is none:
+  - both files in the chart: the pair is theirs;
+  - neither: nothing is being replaced, so the release keeps the pair it
+    serves, from fortiaigate-external-tls-secret, or, on the first upgrade
+    from 8.0.2, from fortiaigate-tls-secret without its internal-tls-revision
+    annotation, where 8.0.2 kept it (fortiaigate.internalTlsDecide);
+  - neither and nothing to keep (a first install, or `helm template` and
+    --dry-run=client, where lookup finds nothing), or only one of the two:
+    the render fails and names the path.
+Until Mantis 1369114 the chart rendered a missing file as a null tls.crt and
+tls.key, which an upgrade applied over the certificate the release served.
+*/}}
+{{- define "fortiaigate.externalTlsDecide" -}}
+{{- $hasCrt := ne (trim .crt) "" -}}
+{{- $hasKey := ne (trim .key) "" -}}
+{{- if and $hasCrt $hasKey -}}
+{{- toJson (dict "crt" (b64enc .crt) "key" (b64enc .key) "kept" "") -}}
+{{- else if or $hasCrt $hasKey -}}
+{{- $missing := ternary (list "tls.key" .keyPath "key") (list "tls.cert" .certPath "certificate") $hasCrt -}}
+{{- $there := ternary (list "tls.cert" .certPath) (list "tls.key" .keyPath) $hasCrt -}}
+{{- fail (printf "%s (%s) is not in the chart, or is empty, while %s (%s) is: copy the %s that goes with it into the chart at %s. With neither file in the chart, an upgrade keeps the certificate the release already serves." (index $missing 0) (index $missing 1) (index $there 0) (index $there 1) (index $missing 2) (index $missing 1)) -}}
+{{- else -}}
+{{- $from := "" -}}
+{{- $data := dict -}}
+{{- if and (dig "data" "tls.crt" "" .external) (dig "data" "tls.key" "" .external) -}}
+{{- $from = "fortiaigate-external-tls-secret" -}}
+{{- $data = .external.data -}}
+{{- else if and (not (hasKey (dig "metadata" "annotations" dict .legacy) "fortiaigate.io/internal-tls-revision")) (dig "data" "tls.crt" "" .legacy) (dig "data" "tls.key" "" .legacy) -}}
+{{- $from = "fortiaigate-tls-secret" -}}
+{{- $data = .legacy.data -}}
+{{- end -}}
+{{- if not $from -}}
+{{- fail (printf "tls.cert (%s) and tls.key (%s) are not in the chart, and there is no external certificate in the cluster to keep (Secret fortiaigate-external-tls-secret): copy the certificate and its key into the chart at those paths. helm template and helm upgrade --dry-run=client cannot read that Secret; check an upgrade with --dry-run=server." .certPath .keyPath) -}}
+{{- end -}}
+{{- toJson (dict "crt" (get $data "tls.crt") "key" (get $data "tls.key") "kept" $from) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Checksum of each pod that serves the external certificate (Auth, webui, api,
+llm-gateway, plugin-adapter, mcp-gateway): the sha256sum of the certificate
+and key it serves (fortiaigate.externalTls), so the pod restarts when they
+change, and not when an upgrade keeps them. It is the sum the chart has always
+taken of the two files. Without tls.enabled nothing serves it: the sum of
+nothing.
+*/}}
+{{- define "fortiaigate.externalTlsChecksum" -}}
+{{- if .Values.tls.existingSecret -}}
+{{- .Values.tls.existingSecretChecksum -}}
+{{- else if .Values.tls.enabled -}}
+{{- $external := include "fortiaigate.externalTls" . | fromJson -}}
+{{- printf "%s%s" (b64dec $external.crt) (b64dec $external.key) | sha256sum -}}
+{{- else -}}
+{{- "" | sha256sum -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+How the pre-upgrade schema preflight (templates/schema-preflight.yaml)
+verifies PostgreSQL, from "secret" (fortiaigate-tls-secret as it is in the
+cluster, or an empty map when there is none) and "live" (true when the render
+reads a cluster: the release's PostgreSQL password Secret was found):
+"verify-full", "verify-ca" or "missing".
+
+The hook runs before Helm changes anything, so it dials the PostgreSQL that is
+running, which serves the certificate in the Secret as it is NOW, not the one
+this render may generate (fortiaigate.internalTlsDecide):
+  - "verify-full", the chain and the name, as api does: a Secret with the
+    internal-tls-revision annotation holds the internal certificate, which
+    names <release>-postgresql in every 8.0.3 chart. Also under `helm
+    template`, where lookup finds nothing.
+  - "verify-ca", the chain only: a Secret without that annotation is the one
+    8.0.2 kept under this name, the external certificate (tls.cert), which
+    names no Service. 8.0.2's default, files/certificate/dflt.crt, has no
+    subjectAltName at all, so verify-full refused every upgrade from 8.0.2
+    ("x509: certificate is not valid for any names", Mantis 1365714).
+    PostgreSQL's certificate must still chain to the Secret's tls.crt: what
+    8.0.2's own clients check (pgx reads their sslmode=require with a root
+    certificate as verify-ca). Only the first upgrade from 8.0.2 sees it: that
+    upgrade replaces the certificate and restarts PostgreSQL with the new one.
+  - "missing": the cluster has the release but not the Secret, so nothing can
+    verify the PostgreSQL that is running. The Secret was deleted, or
+    PostgreSQL ran without TLS until this upgrade. The hook refuses to render
+    rather than wait for a volume that never mounts.
+*/}}
+{{- define "fortiaigate.schemaPreflightTls" -}}
+{{- if not .secret -}}
+{{- ternary "missing" "verify-full" .live -}}
+{{- else if get (dig "metadata" "annotations" dict .secret) "fortiaigate.io/internal-tls-revision" -}}
+verify-full
+{{- else -}}
+verify-ca
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -755,6 +870,38 @@ it did. NOTES.txt says which flags extraArgs overrode. Args: root, flag.
 {{- if $hit -}}true{{- end -}}
 {{- end }}
 
+{{/*
+"true" when vLLM reports, per request, the prompt tokens it took from its
+prefix cache (--enable-prompt-tokens-details): policy-guard takes the rules
+and the template out and the scan's usage report gives the rest as the POLICY
+kv_cache_hit_tokens (2026-11-18). vllm.promptTokensDetails false — the boolean
+or the string "false" (--set-string, a quoted value) — turns it off; a values
+file that has no such key (one copied before it existed) keeps it on. In
+vllm.extraArgs the LAST of --enable-prompt-tokens-details and
+--no-enable-prompt-tokens-details decides, as it does for vLLM (the chart
+renders its own flag before the extraArgs, and only when they carry none).
+Both the vLLM arguments and policy-guard's
+POLICYGUARD_VLLM_PROMPT_TOKENS_DETAILS read this one answer, so they cannot
+disagree. Args: the root context.
+*/}}
+{{- define "fortiaigate.vllmPromptTokensDetails" -}}
+{{- $v := (.Values.vllm | default dict) -}}
+{{- $arg := "" -}}
+{{- range ($v.extraArgs | default list) -}}
+{{- $a := toString . | trim -}}
+{{- if or (eq $a "--enable-prompt-tokens-details") (hasPrefix "--enable-prompt-tokens-details=" $a) -}}
+{{- $arg = "on" -}}
+{{- else if eq $a "--no-enable-prompt-tokens-details" -}}
+{{- $arg = "off" -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $arg "on" -}}
+true
+{{- else if and (ne $arg "off") (ne (toString $v.promptTokensDetails) "false") -}}
+true
+{{- end -}}
+{{- end }}
+
 {{/* Shared storage must resolve identically inside the PostgreSQL/Redis
 subchart contexts. Their .Chart.Name is not the parent chart's name. For a
 custom parent fullnameOverride, set global.fortiaigateStorageClaim too. */}}
@@ -769,12 +916,25 @@ custom parent fullnameOverride, set global.fortiaigateStorageClaim too. */}}
 {{- end -}}
 
 {{/*
-The ingress controller the chart writes annotations for: ingress.controllerType
-when set (a custom class name), else ingress.className. ingress.yaml,
-auth-ingress.yaml and the backend Services all ask this one helper.
+The unified Ingress and backend Services use ingress.controllerType when set
+for a custom class name, then fall back to ingress.className.
 */}}
 {{- define "fortiaigate.ingressController" -}}
 {{- default .Values.ingress.className .Values.ingress.controllerType -}}
+{{- end }}
+
+{{/*
+ingress-nginx strict path validation rejects the dot in .well-known for
+Prefix/Exact. ImplementationSpecific keeps these metadata URLs literal without
+enabling regex or changing the ordinary application paths. Other controllers
+retain their existing Prefix behavior.
+*/}}
+{{- define "fortiaigate.metadataPathType" -}}
+{{- if eq (include "fortiaigate.ingressController" .) "nginx" -}}
+ImplementationSpecific
+{{- else -}}
+Prefix
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -813,14 +973,6 @@ runtime, so a malformed one is refused here.
 {{- default "fortiaigate-external-tls-secret" .Values.tls.existingSecret -}}
 {{- end }}
 
-{{- define "fortiaigate.tlsChecksum" -}}
-{{- if .Values.tls.existingSecretChecksum -}}
-{{- .Values.tls.existingSecretChecksum -}}
-{{- else -}}
-{{- printf "%s%s" (tpl (.Files.Get .Values.tls.cert) $) (tpl (.Files.Get .Values.tls.key) $) | sha256sum -}}
-{{- end -}}
-{{- end }}
-
 {{- define "fortiaigate.internalTlsSecretName" -}}
 {{- default "fortiaigate-tls-secret" .Values.tls.internalExistingSecret -}}
 {{- end }}
@@ -844,4 +996,173 @@ runtime, so a malformed one is refused here.
 {{- define "fortiaigate.internalTlsCAFile" -}}
 {{- $name := ternary "ca.crt" "tls.crt" (not (empty .Values.tls.internalExistingSecret)) -}}
 {{- printf "%s/%s" (include "fortiaigate.internalTlsMountPath" .) $name -}}
+{{- end -}}
+
+{{/*
+"true" when the dotted key .path (e.g. "llmGateway.env.upstreamTls.verify") is
+present in .values, whatever its value; empty otherwise. NOTES.txt names with
+it the keys that moved out of the chart and that a values file still sets. It
+never fails the render: a step that is not a map ends the walk.
+*/}}
+{{- define "fortiaigate.valuesHas" -}}
+{{- $cur := .values -}}
+{{- $found := true -}}
+{{- range $k := splitList "." .path -}}
+{{- if not (kindIs "map" $cur) -}}
+{{- $found = false -}}
+{{- else if not (hasKey $cur $k) -}}
+{{- $found = false -}}
+{{- $cur = "" -}}
+{{- else -}}
+{{- $cur = index $cur $k -}}
+{{- end -}}
+{{- end -}}
+{{- if $found }}true{{ end -}}
+{{- end }}
+
+{{/* Common public routes use HTTPS. Merge optional annotations by key so a
+certificate or subnet setting cannot remove IP targets, TLS or timeouts. */}}
+{{- define "fortiaigate.ingressAnnotations" -}}
+{{- $class := include "fortiaigate.ingressController" . -}}
+{{- $defaults := dict -}}
+{{- if eq $class "alb" -}}
+{{- $defaults = dict
+  "alb.ingress.kubernetes.io/scheme" "internet-facing"
+  "alb.ingress.kubernetes.io/target-type" "ip"
+  "alb.ingress.kubernetes.io/backend-protocol" "HTTPS"
+  "alb.ingress.kubernetes.io/healthcheck-protocol" "HTTPS"
+  "alb.ingress.kubernetes.io/listen-ports" "[{\"HTTPS\":443}]"
+  "alb.ingress.kubernetes.io/ssl-policy" "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  "alb.ingress.kubernetes.io/load-balancer-attributes" "idle_timeout.timeout_seconds=600" -}}
+{{- else if eq $class "nginx" -}}
+{{- $defaults = dict
+  "nginx.ingress.kubernetes.io/app-root" "/ui"
+  "nginx.ingress.kubernetes.io/proxy-body-size" "64m"
+  "nginx.ingress.kubernetes.io/proxy-read-timeout" "600"
+  "nginx.ingress.kubernetes.io/proxy-send-timeout" "600"
+  "nginx.ingress.kubernetes.io/proxy-buffering" "off"
+  "nginx.ingress.kubernetes.io/backend-protocol" "HTTPS"
+  "nginx.ingress.kubernetes.io/ssl-redirect" "true"
+  "nginx.ingress.kubernetes.io/force-ssl-redirect" "false" -}}
+{{- else if eq $class "traefik" -}}
+{{- $defaults = dict "traefik.ingress.kubernetes.io/router.entrypoints" "websecure"
+  "traefik.ingress.kubernetes.io/router.middlewares" "default-redirect-https@kubernetescrd" -}}
+{{- end -}}
+{{- $annotations := mergeOverwrite $defaults (deepCopy (.Values.ingress.annotations | default dict)) -}}
+{{- range $key, $value := $annotations }}
+{{ $key }}: {{ $value | quote }}
+{{- end -}}
+{{- end -}}
+
+{{/* Per-Service checks use the target's real HTTPS listener and health path.
+The Auth Service's two public ports both implement /healthz. */}}
+{{- define "fortiaigate.publicBackendAnnotations" -}}
+{{- if eq (include "fortiaigate.ingressController" .root) "alb" }}
+alb.ingress.kubernetes.io/healthcheck-protocol: "HTTPS"
+alb.ingress.kubernetes.io/healthcheck-port: "traffic-port"
+alb.ingress.kubernetes.io/healthcheck-path: {{ .path | quote }}
+alb.ingress.kubernetes.io/success-codes: {{ default "200" .successCodes | quote }}
+{{- else -}}
+{{- include "fortiaigate.traefikBackendAnnotations" .root -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+A component's free-form `env:` map (guardrail.<component>.env, actionGuard.env,
+observability.env, mcpGateway.env, fabric.env), rendered LAST in its
+container's env list. A container never carries one name twice (Mantis
+1354184): the kubelet would keep the last entry with nothing saying which won,
+and `helm upgrade` cannot patch such a list: it fails ("The order in patch
+list ... doesn't match $setElementOrder list") or drops the second entry with
+no error. So each key of the map is one of:
+
+  - owned: a name the chart sets in this container itself (wiring, a Secret,
+    a TLS path, a connection setting). The render FAILS, naming the key and
+    what to set instead. The list is every name the chart MAY set there, not
+    the ones this render happens to set, so a values file renders or fails
+    alike with or without GPUs, TLS or vLLM.
+  - skip: a name rendered elsewhere: a tunable the chart renders ONCE, the
+    map's value first (SCANNER_CACHE_MAX_BYTES, the dispatcher's two GPU
+    queue sizes), or a retired name, which NOTES.txt names.
+  - anything else: NAME=value, in key order.
+A tunable the chart renders only when the map lacks it (action-guard's
+EVENT_BUS_ENABLED, observability's DB_POOL_SIZE) is neither: the map's entry
+is then the only one.
+
+Args (dict): env (the map; nil renders nothing), path (its values path, for
+the message), owned (list of names), skip (list of names).
+
+Usage, last in a container's env list:
+  {{- with (include "fortiaigate.extraEnv" (dict "env" .Values.x.env "path" "x.env" "owned" $owned) | trim) }}
+  {{- . | nindent 8 }}
+  {{- end }}
+
+k8s/tests/test_env_overrides_render.py sets, in its map, each name every one
+of these containers is rendered with, and fails on a second entry or on a
+value the map did not win: a name a template starts to set must join its
+owned list, or its skip list if it is rendered once from the map.
+*/}}
+{{- define "fortiaigate.extraEnv" -}}
+{{- $owned := .owned | default list -}}
+{{- $skip := .skip | default list -}}
+{{- $path := .path -}}
+{{- range $k, $v := (.env | default dict) }}
+{{- if has $k $owned }}
+{{- fail (printf "%s.%s: the chart sets %s in this container itself; %s. Remove it from %s." $path $k $k (include "fortiaigate.extraEnvHint" $k) $path) }}
+{{- else if not (has $k $skip) }}
+- name: {{ $k }}
+  value: {{ $v | quote }}
+{{- end }}
+{{- end }}
+{{- end }}
+
+{{/*
+What to do instead, for fortiaigate.extraEnv's refusal of an owned name.
+*/}}
+{{- define "fortiaigate.extraEnvHint" -}}
+{{- $by := dict
+  "FORTIAIGATE_LOG_LEVEL" "set fortiaigate.env.logLevel instead"
+  "LOG_LEVEL" "set fortiaigate.env.logLevel instead"
+  "GUARDRAIL_MAX_REQUEST_BYTES" "set guardrail.env.maxRequestBytes instead, which plugin-adapter sizes its body limit from too"
+  "GUARDRAIL_SHORT_CIRCUIT_DEFAULT" "set guardrail.env.shortCircuitDefault instead"
+  "GUARDRAIL_METERING_METRICS_ENDPOINTS" "add yours under guardrail.externalMetering instead"
+  "GUARDRAIL_METERING_ENDPOINTS" "add yours under guardrail.externalMetering instead"
+  "GUARDRAIL_METERING_SERVICE_PAIRS" "add yours under guardrail.externalMetering instead"
+  "POLICYGUARD_VLLM_URL" "it is the vLLM server the chart deploys (the vllm section)"
+  "POLICYGUARD_VLLM_MODEL" "it must be the name the chart's vLLM serves the model under, or every POLICY scan fails closed"
+  "POLICYGUARD_VLLM_PROMPT_TOKENS_DETAILS" "it follows the flags the chart starts vLLM with"
+  "POLICYGUARD_STUB" "it is set where no vLLM runs (fortiaigate.gpu.enabled false, or vllm.replicas 0)"
+  "TRITON_TLS" "it follows tls.enabled"
+  "FAIG_MASTER_KEY" "it comes from the chart's Secret"
+  "FAIG_INTERNAL_TOKEN" "it comes from the chart's Secret"
+  "FAIG_MCP_ADMISSION_KEY" "it comes from the chart's Secret"
+  "POSTGRES_PASSWORD" "it comes from the chart's Secret"
+  "REDIS_PASSWORD" "it comes from the chart's Secret"
+  "FAIG_DATABASE_URL" "it follows the postgresql section"
+  "POSTGRES_USER" "it follows the postgresql section"
+  "POSTGRES_DB" "it follows the postgresql section"
+  "POSTGRES_HOST" "it follows the postgresql section"
+  "POSTGRES_PORT" "it follows the postgresql section"
+  "REDIS_URL" "it follows the redis section"
+  "REDIS_HOST" "it follows the redis section"
+  "REDIS_PORT" "it follows the redis section"
+  "REDIS_CLUSTER" "it follows the redis section"
+  "PV_SIZE" "set storage.size instead"
+  "UPSTREAM_ALLOWED_HOSTS" "set mcpGateway.egress.allowedHosts instead"
+  "MCP_GATEWAY_ORGANIZATION_ID" "the bundled Auth sets it up"
+  "FAIG_SETUP_ORGANIZATION" "the bundled Auth sets it up"
+  "FABRIC_MTLS_BIND_SERIAL" "set fabric.bindSerial instead"
+  "FABRIC_ORG_ID" "set fabric.orgId instead"
+  "GOMEMLIMIT" "set fabric.goMemLimit instead"
+  "FAIG_MEMORY_LIMIT_BYTES" "it follows fabric.resources.limits.memory"
+  "FABRIC_INSTREAM_WINDOW_CHARS" "set fabric.inStream.windowChars instead"
+  "FABRIC_INSTREAM_HOLDBACK_CHARS" "set fabric.inStream.holdbackChars instead"
+-}}
+{{- if hasKey $by . -}}{{ get $by . }}
+{{- else if hasPrefix "REDIS_SSL_" . -}}it follows redis.tls.enabled
+{{- else if hasPrefix "POSTGRES_SSL_" . -}}it follows postgresql.tls.enabled
+{{- else if or (hasPrefix "FAIG_INTERNAL_TLS_" .) (hasPrefix "FORTIAIGATE_SSL_" .) (hasPrefix "FAIG_GUARDRAIL_TLS" .) -}}it follows tls.enabled and tls.mutual
+{{- else if hasPrefix "FAIG_AUTH_" . -}}it names the bundled Auth and its workload certificate
+{{- else -}}it is the chart's wiring and cannot be overridden
+{{- end -}}
 {{- end }}

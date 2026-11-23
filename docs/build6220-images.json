@@ -1,0 +1,98 @@
+{
+  "release": "V8.0.3-build6220",
+  "chart_archive": "FAIG_helm_chart-V8.0.3-build6220-FORTINET.tar.gz",
+  "chart_archive_sha256": "c6c6a61eb11fe597763ec9f0fc720a0894f7b2715a32181498d9dc877bc5c148",
+  "source_repository": "dops-jfrog.fortinet-us.com/docker-fortiaigate-local",
+  "images": [
+    {
+      "image": "action-guard",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:1418360cbac58e690eefed662ced9de8aeacd24ab9afa64a3e1843e56514023d"
+    },
+    {
+      "image": "api",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:5562be310a16354a79b7155efbe387d3444b4e51cd5d040950777660ef6b8060"
+    },
+    {
+      "image": "auth",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:c55774e4a5d9d9f9e96bd1a5913a9d7657375278cd0bf82768201116004dd6f6"
+    },
+    {
+      "image": "custom-triton",
+      "tag": "25.11-onnx-trt-agt-rpt-s1",
+      "config_digest": "sha256:f9cfa981387c8990e991bfa751d6ece466983574386ebabaf8cf9b4c7e271ac9"
+    },
+    {
+      "image": "device-adapter",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:c8cd03ac2e14986b6c80f80bca568c8627bf127f622717de1c7833e0ce9c4aa1"
+    },
+    {
+      "image": "fabric",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:9d7c180877270406ff83b7689523a37b0411c1f803901cbc0b1d1db664bbaa12"
+    },
+    {
+      "image": "faig-models",
+      "tag": "0.0.6-s1",
+      "config_digest": "sha256:ae5169294caaacbafcc075fd425a3110ccc903374b46f969aea2323897a484f2"
+    },
+    {
+      "image": "guardrail",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:9ddf1d4e097b653142d0431599551a19deb707542e66233f6f09979f22002db2"
+    },
+    {
+      "image": "guardrail-scanner",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:820b8c88984da9c496f6f9feeeecc89478babb85d05a5b9a69c78aadac0de818"
+    },
+    {
+      "image": "license_manager",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:140176cb12d71b6a12a223be4f7a1840a7831ddbac37a90b60a3ba3b14eab975"
+    },
+    {
+      "image": "llm-gateway",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:30ab60bee33b364aef4f06872ec2910b8f9967af58a6872654b746e47e0746a8"
+    },
+    {
+      "image": "logd",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:9d0269d005c733111e99690b6bbd922a7c701639c3e5ba5cdff41ae16197863a"
+    },
+    {
+      "image": "mcp-gateway",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:0f16d18c79080db5f78cca9e4a52c17aee0c4fa475fd9f9115886160a1fd6e6b"
+    },
+    {
+      "image": "observability",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:ed45c298b6edb9a1e069b19e67c5af78e365c2a832431b4d0d48ea59b1e002f1"
+    },
+    {
+      "image": "plugin-adapter",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:f204a6f9c753c18cd327ee30236213cd941c098228fee8522ea63da8c659c7a4"
+    },
+    {
+      "image": "plugin-adapter-mcp",
+      "tag": "V8.0.3-build6220",
+      "config_digest": "sha256:bddf6d35771a39c0bf3904728c851c442d7aa704efe2768152ca9179123c445b"
+    },
+    {
+      "image": "vllm-server",
+      "tag": "0.28.0-1-rpt-s1",
+      "config_digest": null
+    },
+    {
+      "image": "webui",
+      "tag": "V8.0.3-build6220",
+      "config_digest": null
+    }
+  ]
+}

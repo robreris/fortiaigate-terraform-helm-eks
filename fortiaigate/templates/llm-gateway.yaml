@@ -1,6 +1,3 @@
-{{- if and (not .Values.auth.enabled) (gt (int .Values.llmGateway.replicas) 0) }}
-{{- fail "LLM RBAC accounting requires bundled Auth. Enable auth.enabled, or set llmGateway.replicas=0 for an external-Auth MCP-only deployment." }}
-{{- end }}
 # Core Deployment
 apiVersion: apps/v1
 kind: Deployment
@@ -23,7 +20,7 @@ spec:
       annotations:
         # This is the key that triggers a restart when TLS certificates change
         checksum/auth: {{ toJson .Values.auth | sha256sum }}
-        checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
+        checksum/tls: {{ include "fortiaigate.externalTlsChecksum" . | quote }}
         {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
         checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
         {{- end }}
@@ -77,13 +74,13 @@ spec:
         resources:
           {{- toYaml .Values.llmGateway.resources | nindent 10 }}
         env:
-        {{- if .Values.auth.enabled }}
+
         - {name: FAIG_AUTH_URL, value: "https://auth:9000"}
         - {name: FAIG_AUTH_WORKLOAD_CERT_FILE, value: /run/faig-auth/tls.crt}
         - {name: FAIG_AUTH_WORKLOAD_KEY_FILE, value: /run/faig-auth/tls.key}
         - {name: FAIG_AUTH_SERVER_CA_FILE, value: /run/faig-auth/ca.crt}
         # Usage accounting needs Auth; inbound LLM OAuth remains unsupported.
-        {{- end }}
+
         {{- if .Values.llmGateway.resources.limits.memory }}
         # The gateway derives its admission budget AND GOMEMLIMIT from this, so
         # changing resources.limits.memory below moves both without a second
@@ -106,8 +103,6 @@ spec:
           value: {{ .Values.llmGateway.env.poolSize | quote }}
         - name: AIFLOW_LOG_REDIS_POOL_SIZE
           value: {{ .Values.llmGateway.env.logRedisPoolSize | quote }}
-        - name: UPSTREAM_LLM_REQUEST_TIMEOUT
-          value: {{ .Values.llmGateway.env.upstreamLlmRequestTimeout | quote }}
         # The guardrail dispatcher pool (faig.guardrail.v1/Scan) the guard
         # stages call. TLS posture is inferred in-process from
         # FORTIAIGATE_SSL_CERT_FILE — the pool serves TLS exactly when the
@@ -126,10 +121,27 @@ spec:
         - name: FAIG_INSTREAM_HOLDBACK_CHARS
           value: {{ . | quote }}
         {{- end }}
-        - name: UPSTREAM_TLS_VERIFY
-          value: {{ .Values.llmGateway.env.upstreamTls.verify | quote }}
-        - name: PASSTHROUGH_TLS_VERIFY
-          value: {{ .Values.llmGateway.env.upstreamTls.verify | quote }}
+        # The Batch API settings (docs/8.0.3/batch-api technical spec §14.1).
+        # Rendered only when set ("false" and "0" are set), so the binary's
+        # defaults stay the single source of truth.
+        {{- $batch := ((.Values.llmGateway.env).batch) | default dict }}
+        {{- range $key, $name := dict "workerEnabled" "FAIG_BATCH_WORKER_ENABLED" "workerJobs" "FAIG_BATCH_WORKER_JOBS" "scanConcurrency" "FAIG_BATCH_SCAN_CONCURRENCY" "pollInterval" "FAIG_BATCH_POLL_INTERVAL" "scanMaxWait" "FAIG_BATCH_SCAN_MAX_WAIT" "scanCallTimeout" "FAIG_BATCH_SCAN_CALL_TIMEOUT" "maxFileBytes" "FAIG_BATCH_MAX_FILE_BYTES" "maxRequests" "FAIG_BATCH_MAX_REQUESTS" "maxLineBytes" "FAIG_BATCH_MAX_LINE_BYTES" "storageMaxBytes" "FAIG_BATCH_STORAGE_MAX_BYTES" "unusedFileTtl" "FAIG_BATCH_UNUSED_FILE_TTL" "retention" "FAIG_BATCH_RETENTION" "maxFindingRows" "FAIG_BATCH_MAX_FINDING_ROWS" }}
+        {{- $v := index $batch $key }}
+        {{- if kindIs "float64" $v }}
+        {{- /* a YAML number is a float64 to helm: 62914560 would print 6.291456e+07 */}}
+        {{- $v = int64 $v }}
+        {{- end }}
+        {{- if and (not (kindIs "invalid" $v)) (ne (toString $v) "") }}
+        - name: {{ $name }}
+          value: {{ $v | toString | quote }}
+        {{- end }}
+        {{- end }}
+        # The request timeout, the keep-alive of a Base URL's idle connections
+        # and TLS verification are each AI provider's Connection settings
+        # (Models › AI Providers), read from the configuration snapshot: no
+        # variable here (UPSTREAM_LLM_REQUEST_TIMEOUT, UPSTREAM_TLS_VERIFY,
+        # PASSTHROUGH_TLS_VERIFY and UPSTREAM_BASE_URL_KEEPALIVE_TIMEOUT are
+        # ignored since 8.0.3).
         - name: PASSTHROUGH_REFUSE_PRIVATE_TARGETS
           value: {{ (.Values.llmGateway.env.passthroughRefusePrivateTargets | default false) | quote }}
         # Bifrost core >= v1.10 refuses to dial RFC 1918 hosts unless told
@@ -138,11 +150,6 @@ spec:
         # default is true = dial what the operator typed, as 8.0.1 did.
         - name: UPSTREAM_ALLOW_PRIVATE_NETWORK
           value: {{ .Values.llmGateway.env.upstreamAllowPrivateNetwork | quote }}
-        # An idle connection to a Base URL integration is retired before the
-        # server's own keep-alive closes it (Mantis 1351340). Empty falls back
-        # to the gateway's default, 4s.
-        - name: UPSTREAM_BASE_URL_KEEPALIVE_TIMEOUT
-          value: {{ .Values.llmGateway.env.upstreamBaseUrlKeepaliveTimeout | quote }}
         # Master key decrypting provider credentials at the egress point
         # (go-common/secret). Same resolution as api/guardrail — see
         # fortiaigate.masterKeySecretName in _helpers.tpl. Without this, any
@@ -238,9 +245,9 @@ spec:
         - name: POSTGRES_PORT
           value: "{{ .Values.postgresql.primary.service.port }}"
         volumeMounts:
-        {{- if .Values.auth.enabled }}
+
         - {name: auth-workload, mountPath: /run/faig-auth, readOnly: true}
-        {{- end }}
+
         - name: shared-data
           mountPath: /etc/fortiaigate/
           readOnly: false
@@ -257,13 +264,13 @@ spec:
           readOnly: true
         {{- end }}
       volumes:
-      {{- if .Values.auth.enabled }}
+
       - name: auth-workload
         secret:
           secretName: {{ include "fortiaigate.authSecret" (dict "root" . "override" .Values.auth.llmWorkloadSecretName) | quote }}
           {{- include "fortiaigate.authSecretItems" (dict "component" "llm" "override" .Values.auth.llmWorkloadSecretName) | nindent 10 }}
           defaultMode: 0440
-      {{- end }}
+
       - name: shared-data
         persistentVolumeClaim:
           claimName: {{ include "fortiaigate.fullname" . }}-storage
@@ -288,15 +295,9 @@ apiVersion: v1
 kind: Service
 metadata:
   name: llm-gateway
-  {{- if eq (include "fortiaigate.ingressController" .) "alb" }}
-  annotations:
-    alb.ingress.kubernetes.io/healthcheck-path: {{ .Values.ingress.healthcheck.llmGateway | quote }}
-    alb.ingress.kubernetes.io/success-codes: "200"
-  {{- else }}
-  {{- with include "fortiaigate.traefikBackendAnnotations" . }}
+  {{- with include "fortiaigate.publicBackendAnnotations" (dict "root" . "path" .Values.ingress.healthcheck.llmGateway) }}
   annotations:
     {{- . | nindent 4 }}
-  {{- end }}
   {{- end }}
   labels:
     app.kubernetes.io/name: fortiaigate

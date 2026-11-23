@@ -1,0 +1,6 @@
+# On-prem profile. Override className when the installed controller uses another class.
+ingress:
+  className: nginx
+  controllerType: nginx
+tls:
+  enabled: true

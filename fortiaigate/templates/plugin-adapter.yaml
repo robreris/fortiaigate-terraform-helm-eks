@@ -37,22 +37,13 @@ adapter certificate Auth issues (fortiaigate.authSecret).
 {{- /* The adapter serves the AgentGuard certificate (an explicit secret, or
 the one Auth issues) only where the external one does not apply. */ -}}
 {{- $agTls := and $managed (or (($pa.managedAuth).tlsSecretName) (not .Values.tls.enabled)) }}
-{{- if not $legacy }}
-{{- if and (not $.Values.auth.enabled) (not (($pa.managedAuth).organizationId)) }}
-{{- fail "pluginAdapter.managedAuth.organizationId is required for managed AgentGuard" }}
-{{- end }}
-{{- if and (not $.Values.auth.enabled) (not (($pa.managedAuth).tlsSecretName)) (not .Values.tls.enabled) }}
-{{- fail "pluginAdapter.managedAuth.tlsSecretName is required for managed AgentGuard HTTPS when tls.enabled is false" }}
-{{- end }}
-{{- if and (not $.Values.auth.enabled) (not (hasPrefix "https://" (toString (.Values.mcpGateway.env).FAIG_AUTH_URL))) }}
-{{- fail "managed AgentGuard requires an HTTPS mcpGateway.env.FAIG_AUTH_URL" }}
-{{- end }}
-{{- range $key := list "FAIG_SETUP_ORGANIZATION" "MCP_GATEWAY_ORGANIZATION_ID" "FAIG_AUTH_WORKLOAD_CERT_FILE" "FAIG_AUTH_WORKLOAD_KEY_FILE" "FAIG_AUTH_SERVER_CA_FILE" }}
-{{- if hasKey $.Values.mcpGateway.env $key }}
-{{- fail (printf "%s is set by managed AgentGuard; remove the duplicate mcpGateway.env override" $key) }}
-{{- end }}
-{{- end }}
-{{- end }}
+{{- $da := .Values.deviceAdapter }}
+{{- /* device-adapter: on by default, left out in development mode; and its
+own Auth workload identity (_auth.tpl). */}}
+{{- $daOn := include "fortiaigate.deviceAdapterOn" . }}
+{{- $daAuth := include "fortiaigate.deviceAdapterAuth" . }}
+{{- /* mcp-gateway's own Auth names in mcpGateway.env are refused by
+       mcp-gateway.yaml (fortiaigate.extraEnv, Mantis 1354184). */}}
 {{- if and (gt (int $pa.replicas) 1) (not .Values.redis.enabled) }}
 {{- fail "pluginAdapter.replicas above 1 needs redis.enabled: the replicas keep the conversations' state and the open answers there" }}
 {{- end }}
@@ -78,7 +69,7 @@ spec:
         {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
         checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
         {{- end }}
-        checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
+        checksum/tls: {{ include "fortiaigate.externalTlsChecksum" . | quote }}
       labels:
         app: plugin-adapter
     spec:
@@ -172,10 +163,17 @@ spec:
           value: {{ $legacy | quote }}
         - name: PLUGIN_ADAPTER_MANAGED
           value: {{ not $legacy | quote }}
+        {{- if $daOn }}
+        # Managed devices' scans, as device-adapter (below, in this pod)
+        # forwards them on the loopback with a device admission
+        # (docs/8.0.3/managed-devices/device-faig-interface.md §13).
+        - name: PLUGIN_ADAPTER_DEVICE_ADMISSION
+          value: "true"
+        {{- end }}
         {{- if not $legacy }}
         - name: FAIG_ORGANIZATION_ID
-          value: {{ ternary "" $pa.managedAuth.organizationId $.Values.auth.enabled | quote }}
-        - {name: FAIG_SETUP_ORGANIZATION, value: {{ $.Values.auth.enabled | quote }}}
+          value: {{ "" | quote }}
+        - {name: FAIG_SETUP_ORGANIZATION, value: {{ true | quote }}}
         # Signs the companion admissions to Observability and Action Guard.
         - name: FAIG_INTERNAL_TOKEN
           valueFrom:
@@ -187,7 +185,7 @@ spec:
         # workloadTlsSecretName, the identity Auth lets resolve the card's
         # resource), resolves the OAuth token plugin-adapter-mcp forwards.
         - name: FAIG_AUTH_URL
-          value: {{ ternary "https://auth:9000" (.Values.mcpGateway.env).FAIG_AUTH_URL .Values.auth.enabled | quote }}
+          value: {{ "https://auth:9000" | quote }}
         - name: FAIG_AUTH_WORKLOAD_CERT_FILE
           value: "/var/run/faig-workload/tls.crt"
         - name: FAIG_AUTH_WORKLOAD_KEY_FILE
@@ -403,8 +401,8 @@ spec:
           value: "http://127.0.0.1:8766"
         {{- if $managed }}
         - name: FAIG_ORGANIZATION_ID
-          value: {{ ternary "" .Values.pluginAdapter.managedAuth.organizationId .Values.auth.enabled | quote }}
-        - {name: FAIG_SETUP_ORGANIZATION, value: {{ .Values.auth.enabled | quote }}}
+          value: {{ "" | quote }}
+        - {name: FAIG_SETUP_ORGANIZATION, value: {{ true | quote }}}
         # The database, read only: the inbound policy and the Plugins card's
         # Auth resource, which its OAuth metadata describes. Who the caller
         # is, plugin-adapter decides.
@@ -476,6 +474,168 @@ spec:
           mountPath: {{ (include "fortiaigate.internalTlsMountPath" .) | quote }}
           readOnly: true
         {{- end }}
+      {{- if $daOn }}
+      # device-adapter: the device plugin's end, which managed devices running
+      # FortiAIGate Client call under /plugin/device/ (Service device-adapter,
+      # docs/8.0.3/managed-devices). It forwards each scan to plugin-adapter's
+      # loopback listener beside it, with a device admission.
+      - name: device-adapter
+        image: {{ .Values.fortiaigate.image.repository }}/device-adapter:{{ .Values.fortiaigate.image.tag }}
+        imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        ports:
+        - containerPort: 8768
+          name: device
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /plugin/device/health/readiness
+            port: device
+            {{- if .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+        livenessProbe:
+          httpGet:
+            path: /plugin/device/health/liveness
+            port: device
+            {{- if .Values.tls.enabled }}
+            scheme: HTTPS
+            {{- end }}
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          {{- toYaml $da.resources | nindent 10 }}
+        env:
+        - name: DEVICE_ADAPTER_LISTEN_ADDR
+          value: ":8768"
+        {{- if .Values.tls.enabled }}
+        # Its one TLS hop inside the deployment, the licence manager, trusts
+        # the INTERNAL certificate and, under tls.mutual, presents its pair.
+        - name: FAIG_INTERNAL_TLS_CA_FILE
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- if include "fortiaigate.internalMtls" . }}
+        - name: FAIG_INTERNAL_TLS_CERT_FILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: FAIG_INTERNAL_TLS_KEY_FILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        {{- end }}
+        {{- end }}
+        - name: PLUGIN_ADAPTER_URL
+          value: "http://127.0.0.1:8766"
+        # Signs the device admissions plugin-adapter verifies.
+        - name: FAIG_INTERNAL_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: {{ include "fortiaigate.internalTokenSecretName" . }}
+              key: internal-token
+        - name: FAIG_ORGANIZATION_ID
+          value: {{ "" | quote }}
+        - {name: FAIG_SETUP_ORGANIZATION, value: {{ true | quote }}}
+        {{- if $daAuth }}
+        # The device users' sign-ins: Auth resolves their tokens over mTLS
+        # with device-adapter's own workload identity, for the device
+        # resource alone (architecture §3.4.1).
+        - name: FAIG_AUTH_URL
+          value: {{ "https://auth:9000" | quote }}
+        - name: FAIG_AUTH_WORKLOAD_CERT_FILE
+          value: "/var/run/faig-device-workload/tls.crt"
+        - name: FAIG_AUTH_WORKLOAD_KEY_FILE
+          value: "/var/run/faig-device-workload/tls.key"
+        - name: FAIG_AUTH_SERVER_CA_FILE
+          value: "/var/run/faig-device-workload/ca.crt"
+        {{- end }}
+        - name: DEVICE_ADAPTER_SCAN_TIMEOUT_SECONDS
+          value: {{ ($da).scanTimeoutSeconds | default 130 | quote }}
+        - name: POSTGRES_SSL_ENABLED
+          value: {{ .Values.postgresql.tls.enabled | quote }}
+        {{- if .Values.postgresql.tls.enabled }}
+        - name: POSTGRES_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: POSTGRES_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- end }}
+        - name: POSTGRES_USER
+          value: "{{ .Values.postgresql.auth.username }}"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-postgresql
+              key: password
+        - name: POSTGRES_DB
+          value: "{{ .Values.postgresql.auth.database }}"
+        - name: POSTGRES_HOST
+          value: "{{ .Release.Name }}-postgresql"
+        - name: POSTGRES_PORT
+          value: "{{ .Values.postgresql.primary.service.port }}"
+        - name: FORTIAIGATE_LOG_LEVEL
+          value: {{ .Values.fortiaigate.env.logLevel | quote }}
+        # The shared Redis's database 0 (REDIS_DB unset): the device log goes
+        # onto its faig:logs:device stream, which LogD writes.
+        - name: REDIS_HOST
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_HOST
+        - name: REDIS_PORT
+          valueFrom:
+            configMapKeyRef:
+              name: {{ include "fortiaigate.fullname" . }}-db-config
+              key: REDIS_PORT
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: {{ .Release.Name }}-redis
+              key: redis-password
+        - name: REDIS_SSL_ENABLED
+          value: {{ .Values.redis.tls.enabled | quote }}
+        {{- if .Values.redis.tls.enabled }}
+        - name: REDIS_SSL_CERTFILE
+          value: {{ printf "%s/tls.crt" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_KEYFILE
+          value: {{ printf "%s/tls.key" (include "fortiaigate.internalTlsMountPath" .) | quote }}
+        - name: REDIS_SSL_CA_CERTS
+          value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        # The listener the ingress routes /plugin/device/ to: the external
+        # certificate, as api and llm-gateway serve theirs.
+        - name: FORTIAIGATE_SSL_CERT_FILE
+          value: "/etc/tls-external/tls.crt"
+        - name: FORTIAIGATE_SSL_KEY_FILE
+          value: "/etc/tls-external/tls.key"
+        {{- end }}
+        {{- if or $daAuth .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        volumeMounts:
+        {{- if .Values.tls.enabled }}
+        - name: external-tls-certs
+          mountPath: /etc/tls-external
+          readOnly: true
+        {{- end }}
+        {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
+        - name: tls-certs
+          mountPath: {{ include "fortiaigate.internalTlsMountPath" . | quote }}
+          readOnly: true
+        {{- end }}
+        {{- if $daAuth }}
+        - name: device-workload-tls
+          mountPath: /var/run/faig-device-workload
+          readOnly: true
+        {{- end }}
+        {{- end }}
+      {{- end }}
       volumes:
       - name: tmp
         emptyDir: {}
@@ -498,6 +658,12 @@ spec:
           secretName: {{ include "fortiaigate.authSecret" (dict "root" . "override" $gs.workloadTlsSecretName) | quote }}
           {{- include "fortiaigate.authSecretItems" (dict "component" "plugin-mcp" "override" $gs.workloadTlsSecretName) | nindent 10 }}
       {{- end }}
+      {{- if $daAuth }}
+      - name: device-workload-tls
+        secret:
+          secretName: {{ include "fortiaigate.authSecret" (dict "root" . "override" $da.workloadTlsSecretName) | quote }}
+          {{- include "fortiaigate.authSecretItems" (dict "component" "device" "override" $da.workloadTlsSecretName) | nindent 10 }}
+      {{- end }}
       {{- if or .Values.tls.enabled .Values.redis.tls.enabled .Values.postgresql.tls.enabled }}
       - name: tls-certs
         secret:
@@ -514,15 +680,9 @@ metadata:
   name: plugin-adapter
   {{- /* The platform Ingress routes /plugin here (templates/ingress.yaml):
   Traefik dials it over HTTPS, as every routed backend. */}}
-  {{- if eq (include "fortiaigate.ingressController" .) "alb" }}
-  annotations:
-    alb.ingress.kubernetes.io/healthcheck-path: "/plugin/health/readiness"
-    alb.ingress.kubernetes.io/success-codes: "200"
-  {{- else }}
-  {{- with include "fortiaigate.traefikBackendAnnotations" . }}
+  {{- with include "fortiaigate.publicBackendAnnotations" (dict "root" . "path" "/plugin/health/readiness") }}
   annotations:
     {{- . | nindent 4 }}
-  {{- end }}
   {{- end }}
   labels:
     app.kubernetes.io/name: fortiaigate

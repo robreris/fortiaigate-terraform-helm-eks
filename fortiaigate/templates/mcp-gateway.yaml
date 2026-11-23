@@ -1,5 +1,5 @@
 {{- $mcpSecret := .Values.mcpGateway.workloadTlsSecretName }}
-{{- if .Values.auth.enabled }}{{- $mcpSecret = include "fortiaigate.authSecret" (dict "root" . "override" $mcpSecret) }}{{- end }}
+{{- $mcpSecret = include "fortiaigate.authSecret" (dict "root" . "override" $mcpSecret) }}
 # MCP Gateway — the Go port (mcp-gateway/) of VirtueAI's mcp-gateway. :8001,
 # and :8443 with tls.enabled.
 #
@@ -26,18 +26,9 @@
 # llm-gateway's database 0 on purpose: api-go evicts a revoked virtual key's
 # cache entry there.
 #
-# stdio MCP servers (node + python) run in the pod's second container,
-# stdio-runner: the same image as `mcp-gateway -stdio-runner`, another user
-# (10002), no secret in its environment, none mounted, and no ServiceAccount
-# token. Started in the gateway's container, a server could read the
-# gateway's secrets through /proc (src/stdiorunner). The gateway asks the
-# runner over a socket on the stdio-runner volume, /run/mcp-stdio in both;
-# without the runner no stdio server runs. Chart and image move together: on
-# an older image the runner fails (no -stdio-runner flag) and, as a container
-# of the pod, keeps the whole gateway NotReady. On SIGTERM the runner goes on
-# serving until the gateway has exited, for the requests it drains. Both run under tini, the
-# image's ENTRYPOINT: set args, never command, or tini is replaced and every
-# stdio server's grandchildren become zombies.
+# The gateway runs no MCP server's process: stdio servers are retired
+# (2026-11-10), and with them the pod's stdio-runner container. The rollout
+# that removes it stops every stdio server it was running.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -64,7 +55,7 @@ spec:
         checksum/internal-tls: {{ include "fortiaigate.internalTlsChecksum" . | quote }}
         {{- end }}
         # Restart trigger when TLS certificates change.
-        checksum/tls: {{ include "fortiaigate.tlsChecksum" . | quote }}
+        checksum/tls: {{ include "fortiaigate.externalTlsChecksum" . | quote }}
       labels:
         app: mcp-gateway
         component: mcp-gateway
@@ -83,7 +74,7 @@ spec:
         imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
         securityContext:
           allowPrivilegeEscalation: false
-          # It writes nothing but /tmp; stdio servers run in stdio-runner.
+          # It writes nothing but /tmp.
           readOnlyRootFilesystem: true
           capabilities:
             drop:
@@ -100,7 +91,7 @@ spec:
         # /healthz runs SELECT 1 and answers 503 while the database is away or
         # the schema is still loading, so it is the READINESS probe only: a
         # liveness probe on it would restart the pod through every Postgres
-        # outage, killing in-flight tool calls and stdio servers, where the
+        # outage, killing in-flight tool calls, where the
         # process itself rides the outage out. Liveness is the port.
         livenessProbe:
           tcpSocket:
@@ -217,44 +208,45 @@ spec:
           value: {{ include "fortiaigate.internalTlsCAFile" . | quote }}
         {{- end }}
         # ---- the rest, verbatim from values ---------------------------------
-        {{- if or .Values.auth.enabled (ne (toString (.Values.pluginAdapter).legacyDevAuth) "true") }}
         - name: MCP_GATEWAY_ORGANIZATION_ID
-          value: {{ ternary "" .Values.pluginAdapter.managedAuth.organizationId .Values.auth.enabled | quote }}
-        - {name: FAIG_SETUP_ORGANIZATION, value: {{ .Values.auth.enabled | quote }}}
-        {{- if .Values.auth.enabled }}
+          value: {{ "" | quote }}
+        - {name: FAIG_SETUP_ORGANIZATION, value: {{ true | quote }}}
+
         - name: FAIG_AUTH_URL
           value: https://auth:9000
-        {{- end }}
+
         - name: FAIG_AUTH_WORKLOAD_CERT_FILE
           value: "/var/run/faig-workload/tls.crt"
         - name: FAIG_AUTH_WORKLOAD_KEY_FILE
           value: "/var/run/faig-workload/tls.key"
         - name: FAIG_AUTH_SERVER_CA_FILE
           value: "/var/run/faig-workload/ca.crt"
-        {{- end }}
-        - name: UPSTREAM_TLS_VERIFY
-          value: {{ dig "upstreamTls" "verify" false .Values.mcpGateway | quote }}
+
+        # TLS verification of an MCP server is that server's own setting
+        # (Agent Security › MCP Servers, Verify TLS certificates) since 8.0.3:
+        # no UPSTREAM_TLS_VERIFY here, and one in mcpGateway.env is not passed
+        # on (NOTES.txt names it).
         - name: UPSTREAM_ALLOWED_HOSTS
           value: {{ (dig "egress" "allowedHosts" (list) .Values.mcpGateway) | toJson | quote }}
-        {{- range $k, $v := .Values.mcpGateway.env }}
-        {{- if eq $k "UPSTREAM_TLS_VERIFY" }}
-        {{- fail "set mcpGateway.upstreamTls.verify instead of mcpGateway.env.UPSTREAM_TLS_VERIFY" }}
-        {{- end }}
-        {{- if eq $k "UPSTREAM_ALLOWED_HOSTS" }}
-        {{- fail "set mcpGateway.egress.allowedHosts instead of mcpGateway.env.UPSTREAM_ALLOWED_HOSTS" }}
-        {{- end }}
-        {{- if and $.Values.auth.enabled (has $k (list "FAIG_SETUP_ORGANIZATION" "FAIG_AUTH_URL" "MCP_GATEWAY_ORGANIZATION_ID" "FAIG_AUTH_WORKLOAD_CERT_FILE" "FAIG_AUTH_WORKLOAD_KEY_FILE" "FAIG_AUTH_SERVER_CA_FILE")) }}
-        {{- fail (printf "%s is managed by auth.enabled; remove the duplicate MCP environment override" $k) }}
-        {{- end }}
-        - name: {{ $k }}
-          value: {{ $v | quote }}
+        {{- /* The rest, from mcpGateway.env: a name set above is refused
+               (fortiaigate.extraEnv, Mantis 1354184), the bundled Auth's
+               names included. UPSTREAM_TLS_VERIFY is retired. */}}
+        {{- $owned := list "FAIG_INTERNAL_TLS_CA_FILE" "FAIG_INTERNAL_TLS_CERT_FILE" "FAIG_INTERNAL_TLS_KEY_FILE"
+          "FORTIAIGATE_LOG_LEVEL" "GATEWAY_PORT" "GATEWAY_TLS_PORT" "FORTIAIGATE_SSL_CERT_FILE"
+          "FORTIAIGATE_SSL_KEY_FILE" "FAIG_INTERNAL_TOKEN" "FAIG_MASTER_KEY" "ACTION_GUARD_URL"
+          "OBSERVABILITY_URL" "POSTGRES_USER" "POSTGRES_PASSWORD" "POSTGRES_DB" "POSTGRES_HOST"
+          "POSTGRES_PORT" "POSTGRES_SSL_VERIFY" "POSTGRES_SSL_ENABLED" "POSTGRES_SSL_CERTFILE"
+          "POSTGRES_SSL_KEYFILE" "POSTGRES_SSL_CA_CERTS" "REDIS_HOST" "REDIS_PORT" "REDIS_PASSWORD"
+          "REDIS_SSL_VERIFY" "REDIS_SSL_ENABLED" "REDIS_SSL_CERTFILE" "REDIS_SSL_KEYFILE"
+          "REDIS_SSL_CA_CERTS" "UPSTREAM_ALLOWED_HOSTS" "MCP_GATEWAY_ORGANIZATION_ID"
+          "FAIG_SETUP_ORGANIZATION" "FAIG_AUTH_URL" "FAIG_AUTH_WORKLOAD_CERT_FILE"
+          "FAIG_AUTH_WORKLOAD_KEY_FILE" "FAIG_AUTH_SERVER_CA_FILE" }}
+        {{- with (include "fortiaigate.extraEnv" (dict "env" .Values.mcpGateway.env "path" "mcpGateway.env" "owned" $owned "skip" (list "UPSTREAM_TLS_VERIFY")) | trim) }}
+        {{- . | nindent 8 }}
         {{- end }}
         volumeMounts:
         - name: tmp
           mountPath: /tmp
-        # The stdio runner's socket (header).
-        - name: stdio-runner
-          mountPath: /run/mcp-stdio
         {{- if $mcpSecret }}
         - name: auth-workload-tls
           mountPath: /var/run/faig-workload
@@ -270,70 +262,8 @@ spec:
           mountPath: /etc/tls-external
           readOnly: true
         {{- end }}
-      # The stdio runner (header). Its environment and mounts are all it has:
-      # add no secret here.
-      - name: stdio-runner
-        image: {{ .Values.fortiaigate.image.repository }}/mcp-gateway:{{ .Values.fortiaigate.image.tag }}
-        imagePullPolicy: {{ .Values.fortiaigate.image.pullPolicy }}
-        args: ["-stdio-runner"]
-        securityContext:
-          runAsUser: 10002
-          runAsGroup: 10001
-          allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: true
-          capabilities:
-            drop:
-            - ALL
-        env:
-        - name: FORTIAIGATE_LOG_LEVEL
-          value: {{ .Values.fortiaigate.env.logLevel | quote }}
-        # npx keeps its cache here, and servers run here.
-        - name: HOME
-          value: /home/runner
-        # Liveness only: a runner that stops answering is restarted. No
-        # readiness probe, as stdio is one transport of several. Its not
-        # running still makes the whole pod NotReady, as any container's
-        # does (Kubernetes 1.25 has no native sidecars): while it restarts or
-        # crash-loops, the gateway's HTTP and SSE servers are out of service
-        # too.
-        livenessProbe:
-          exec:
-            command: ["/mcp-gateway", "-stdio-runner-probe"]
-          initialDelaySeconds: 5
-          periodSeconds: 10
-          timeoutSeconds: 6
-          failureThreshold: 3
-        # values.yaml's when the release's values predate the runner
-        # (helm upgrade --reuse-values keeps those, without new defaults).
-        {{- $runnerResources := dig "stdioRunner" "resources" dict .Values.mcpGateway }}
-        {{- if not $runnerResources }}
-        {{- $runnerResources = dict "limits" (dict "cpu" "1000m" "memory" "1Gi") "requests" (dict "cpu" "100m" "memory" "256Mi") }}
-        {{- end }}
-        resources:
-          {{- toYaml $runnerResources | nindent 10 }}
-        volumeMounts:
-        - name: stdio-runner
-          mountPath: /run/mcp-stdio
-        - name: stdio-runner-home
-          mountPath: /home/runner
-        - name: stdio-runner-tmp
-          mountPath: /tmp
-        # An empty directory where Kubernetes would mount the pod's
-        # ServiceAccount token: the gateway reads that directory (licence
-        # status), a stdio server must not.
-        - name: no-service-account
-          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
-          readOnly: true
       volumes:
       - name: tmp
-        emptyDir: {}
-      - name: stdio-runner
-        emptyDir: {}
-      - name: stdio-runner-home
-        emptyDir: {}
-      - name: stdio-runner-tmp
-        emptyDir: {}
-      - name: no-service-account
         emptyDir: {}
       {{- if $mcpSecret }}
       - name: auth-workload-tls
@@ -365,20 +295,9 @@ metadata:
     app.kubernetes.io/name: fortiaigate
     app.kubernetes.io/part-of: fortiaigate-platform
     component: mcp-gateway
-  {{- $traefik := include "fortiaigate.traefikBackendAnnotations" . }}
-  {{- if or (eq (include "fortiaigate.ingressController" .) "alb") $traefik }}
+  {{- with include "fortiaigate.publicBackendAnnotations" (dict "root" . "path" "/healthz") }}
   annotations:
-    {{- if eq (include "fortiaigate.ingressController" .) "alb" }}
-    # An ALB target group checks / by default, which the public listener
-    # answers 404. Use the HTTP listener that serves the readiness probe.
-    alb.ingress.kubernetes.io/healthcheck-path: /healthz
-    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
-    alb.ingress.kubernetes.io/healthcheck-port: "8001"
-    alb.ingress.kubernetes.io/success-codes: "200"
-    {{- end }}
-    {{- with $traefik }}
     {{- . | nindent 4 }}
-    {{- end }}
   {{- end }}
 spec:
   # ClusterIP; the platform ingress routes the public surface to http (:8001)

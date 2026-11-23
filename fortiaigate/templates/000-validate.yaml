@@ -1,0 +1,55 @@
+{{/* Fail before deployment instead of rendering mixed-protocol routes. */}}
+{{- if not .Values.tls.enabled -}}
+{{- fail "The unified Ingress requires tls.enabled=true" -}}
+{{- end -}}
+{{- if and (hasKey .Values.auth "enabled") (ne (toString .Values.auth.enabled) "true") -}}
+{{- fail "Auth is always deployed; remove auth.enabled=false" -}}
+{{- end -}}
+{{- if eq (toString ((.Values.inferenceHooks | default dict).enabled)) "true" -}}
+{{- fail "Build 6220 removed the inference-hooks workload. Remove inferenceHooks.enabled=true from the supplied values before upgrading." -}}
+{{- end -}}
+{{- $class := include "fortiaigate.ingressController" . -}}
+{{- $ann := include "fortiaigate.ingressAnnotations" . | fromYaml -}}
+{{- if eq $class "alb" -}}
+{{- $listeners := mustFromJson (toString (get $ann "alb.ingress.kubernetes.io/listen-ports")) -}}
+{{- if not (kindIs "slice" $listeners) -}}
+{{- fail "ALB listen-ports must be a JSON array with an HTTPS listener" -}}
+{{- end -}}
+{{- $hasHTTPS := false -}}
+{{- range $listener := $listeners -}}
+{{- if kindIs "map" $listener -}}
+{{- if hasKey $listener "HTTPS" -}}
+{{- $port := get $listener "HTTPS" -}}
+{{- if and (kindIs "float64" $port) (ge $port 1.0) (le $port 65535.0) (eq $port (float64 (int $port))) -}}
+{{- $hasHTTPS = true -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if not $hasHTTPS -}}
+{{- fail "SCIM requires an ALB HTTPS listener and a TLS 1.3 security policy" -}}
+{{- end -}}
+{{- if ne (toString (get $ann "alb.ingress.kubernetes.io/target-type")) "ip" -}}
+{{- fail "ClusterIP backends require alb.ingress.kubernetes.io/target-type=ip" -}}
+{{- end -}}
+{{- range $key := list "alb.ingress.kubernetes.io/backend-protocol" "alb.ingress.kubernetes.io/healthcheck-protocol" -}}
+{{- if ne (toString (get $ann $key)) "HTTPS" -}}
+{{- fail (printf "%s must be HTTPS for the unified Ingress" $key) -}}
+{{- end -}}
+{{- end -}}
+{{- if not (contains "TLS13" (toString (get $ann "alb.ingress.kubernetes.io/ssl-policy"))) -}}
+{{- fail "SCIM requires an ALB TLS 1.3 security policy (TLS13)" -}}
+{{- end -}}
+{{- else if eq $class "nginx" -}}
+{{- if ne (toString (get $ann "nginx.ingress.kubernetes.io/backend-protocol")) "HTTPS" -}}
+{{- fail "nginx.ingress.kubernetes.io/backend-protocol must be HTTPS for the unified Ingress" -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $class "nginx" -}}
+{{- if hasKey $ann "nginx.ingress.kubernetes.io/rewrite-target" -}}
+{{- fail "The unified Ingress preserves paths; remove nginx.ingress.kubernetes.io/rewrite-target" -}}
+{{- end -}}
+{{- if and (hasKey $ann "nginx.ingress.kubernetes.io/use-regex") (ne (toString (get $ann "nginx.ingress.kubernetes.io/use-regex")) "false") -}}
+{{- fail "The unified Ingress uses literal paths; nginx.ingress.kubernetes.io/use-regex must be false or absent" -}}
+{{- end -}}
+{{- end -}}
